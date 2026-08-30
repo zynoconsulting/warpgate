@@ -4988,6 +4988,31 @@
         ],
         "operationId": "get_secret_reference_usage"
       }
+    },
+    "/instance-ca/certificate": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstanceCaCertificate"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          }
+        ],
+        "operationId": "get_instance_ca_certificate"
+      }
     }
   },
   "components": {
@@ -5884,6 +5909,9 @@
           },
           {
             "$ref": "#/components/schemas/KubernetesTargetAuth_KubernetesTargetIamRoleAuth"
+          },
+          {
+            "$ref": "#/components/schemas/KubernetesTargetAuth_KubernetesTargetEphemeralCertificateAuth"
           }
         ],
         "discriminator": {
@@ -5891,7 +5919,8 @@
           "mapping": {
             "Token": "#/components/schemas/KubernetesTargetAuth_KubernetesTargetTokenAuth",
             "Certificate": "#/components/schemas/KubernetesTargetAuth_KubernetesTargetCertificateAuth",
-            "IamRole": "#/components/schemas/KubernetesTargetAuth_KubernetesTargetIamRoleAuth"
+            "IamRole": "#/components/schemas/KubernetesTargetAuth_KubernetesTargetIamRoleAuth",
+            "EphemeralCertificate": "#/components/schemas/KubernetesTargetAuth_KubernetesTargetEphemeralCertificateAuth"
           }
         }
       },
@@ -9158,6 +9187,55 @@
         "properties": {
           "password": {
             "type": "string"
+          }
+        }
+      },
+      "InstanceCaCertificate": {
+        "type": "object",
+        "title": "InstanceCaCertificate",
+        "required": [
+          "certificate_pem"
+        ],
+        "properties": {
+          "certificate_pem": {
+            "type": "string",
+            "description": "PEM-encoded public certificate for the Warpgate instance CA. Install\nthis certificate in a Kubernetes API server's client-CA trust bundle\nbefore enabling ephemeral-certificate upstream authentication."
+          }
+        }
+      },
+      "KubernetesTargetAuth_KubernetesTargetEphemeralCertificateAuth": {
+        "allOf": [
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "EphemeralCertificate"
+                ],
+                "example": "EphemeralCertificate"
+              }
+            }
+          },
+          {
+            "$ref": "#/components/schemas/KubernetesTargetEphemeralCertificateAuth"
+          }
+        ]
+      },
+      "KubernetesTargetEphemeralCertificateAuth": {
+        "type": "object",
+        "title": "KubernetesTargetEphemeralCertificateAuth",
+        "required": [
+          "validity_seconds"
+        ],
+        "properties": {
+          "validity_seconds": {
+            "type": "integer",
+            "format": "uint32",
+            "description": "Validity of each in-memory upstream certificate. The certificate is\nrenewed for an active Warpgate session before it expires."
           }
         }
       }

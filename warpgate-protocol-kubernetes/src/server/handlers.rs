@@ -286,14 +286,27 @@ async fn _handle_normal_request_inner(
 ) -> Result<Response, WarpgateError> {
     let k8s_options = admitted.options();
     let target_id = admitted.target().id;
-    let client = upstream_clients
-        .get_or_build(&target_id, k8s_options, || async {
-            create_authenticated_client(k8s_options, services)
-                .await?
-                .build()
-                .context("building reqwest client")
-        })
+    let build_client = || async {
+        let builder = create_authenticated_client(
+            k8s_options,
+            admitted.user_info(),
+            target_id,
+            admitted.upstream_certificate_cache(),
+            services,
+        )
         .await?;
+        builder.build().context("building reqwest client")
+    };
+    let client = if matches!(
+        k8s_options.auth,
+        warpgate_common::KubernetesTargetAuth::EphemeralCertificate(_)
+    ) {
+        build_client().await?
+    } else {
+        upstream_clients
+            .get_or_build(&target_id, k8s_options, build_client)
+            .await?
+    };
 
     debug!(
         "Target Kubernetes options: cluster_url={}, auth={:?}",
@@ -302,6 +315,9 @@ async fn _handle_normal_request_inner(
             warpgate_common::KubernetesTargetAuth::Token(_) => "Token",
             warpgate_common::KubernetesTargetAuth::Certificate(_) => "Certificate",
             warpgate_common::KubernetesTargetAuth::IamRole(_) => "IamRole",
+            warpgate_common::KubernetesTargetAuth::EphemeralCertificate(_) => {
+                "EphemeralCertificate"
+            }
         }
     );
 
@@ -582,10 +598,15 @@ async fn _handle_websocket_request_inner(
         let _ = full_url.set_scheme("ws");
     }
 
-    let client = create_authenticated_client(k8s_options, services)
-        .await?
-        .http1_only()
-        .build()?;
+    let client_builder = create_authenticated_client(
+        k8s_options,
+        admitted.user_info(),
+        admitted.target().id,
+        admitted.upstream_certificate_cache(),
+        services,
+    )
+    .await?;
+    let client = client_builder.http1_only().build()?;
 
     // Classified independently of recording: an audit trail must not depend on
     // whether session recording happens to be switched on.

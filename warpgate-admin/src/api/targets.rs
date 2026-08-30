@@ -87,6 +87,12 @@ impl ListApi {
     ) -> Result<CreateTargetResponse, WarpgateError> {
         admin.require(AdminPermission::TargetsCreate)?;
 
+        if let TargetOptions::Kubernetes(options) = &body.options
+            && let Err(error) = options.validate()
+        {
+            return Ok(CreateTargetResponse::BadRequest(Json(error)));
+        }
+
         match store::create(&admin.services().db, &body).await {
             Ok(target) => Ok(CreateTargetResponse::Created(Json(maybe_redacted_target(
                 &admin, target,
@@ -175,6 +181,12 @@ impl DetailApi {
         id: Path<Uuid>,
     ) -> Result<UpdateTargetResponse, WarpgateError> {
         admin.require(AdminPermission::TargetsEdit)?;
+
+        if let TargetOptions::Kubernetes(options) = &body.options
+            && options.validate().is_err()
+        {
+            return Ok(UpdateTargetResponse::BadRequest);
+        }
 
         let services = admin.services();
         let target = match store::update(&services.db, id.0, &body).await {
