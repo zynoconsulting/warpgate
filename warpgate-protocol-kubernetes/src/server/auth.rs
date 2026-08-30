@@ -1,6 +1,6 @@
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
 use poem::Request;
@@ -54,6 +54,13 @@ pub fn unauthorized() -> poem::Error {
     )
 }
 
+pub(crate) struct CachedEphemeralKubernetesIdentity {
+    pem_bundle: String,
+    not_after: SystemTime,
+}
+
+pub(crate) type EphemeralKubernetesIdentityCache =
+    Arc<Mutex<Option<CachedEphemeralKubernetesIdentity>>>;
 /// What kind of credential the client presented, for audit and rate-limiting.
 /// `None` means no credential was presented at all — an unauthenticated probe,
 /// not a failed login attempt.
@@ -439,10 +446,12 @@ async fn user_for_username(services: &Services, username: &str) -> poem::Result<
     })
 }
 
-pub async fn create_authenticated_client(
+pub(crate) async fn create_authenticated_client(
     k8s_options: &TargetKubernetesOptions,
-    _auth_user: Option<&String>,
-    _services: &Services,
+    user_info: &AuthStateUserInfo,
+    target_id: Uuid,
+    upstream_certificate_cache: &EphemeralKubernetesIdentityCache,
+    services: &Services,
 ) -> anyhow::Result<reqwest::ClientBuilder> {
     debug!(
         server_url = ?k8s_options.cluster_url,
@@ -505,9 +514,63 @@ pub async fn create_authenticated_client(
             );
             client_builder = client_builder.default_headers(headers);
         }
+        warpgate_common::KubernetesTargetAuth::EphemeralCertificate(auth) => {
+            auth.validate().map_err(anyhow::Error::msg)?;
+            let pem_bundle = ephemeral_kubernetes_client_identity(
+                auth.validity_seconds,
+                user_info,
+                target_id,
+                upstream_certificate_cache,
+                services,
+            )
+            .await?;
+            let identity = reqwest::Identity::from_pem(pem_bundle.as_bytes())
+                .context("building ephemeral Kubernetes client certificate identity")?;
+            client_builder = client_builder.identity(identity);
+        }
     }
 
     Ok(client_builder)
+}
+
+async fn ephemeral_kubernetes_client_identity(
+    validity_seconds: u32,
+    user_info: &AuthStateUserInfo,
+    target_id: Uuid,
+    cache: &EphemeralKubernetesIdentityCache,
+    services: &Services,
+) -> anyhow::Result<String> {
+    const RENEWAL_SKEW: Duration = Duration::from_secs(15);
+
+    let now = SystemTime::now();
+    let mut cache = cache.lock().await;
+    if let Some(identity) = cache.as_ref()
+        && identity.not_after > now + RENEWAL_SKEW
+    {
+        return Ok(identity.pem_bundle.clone());
+    }
+
+    let parameters = Parameters::Entity::get(&services.db).await?;
+    let username = format!("warpgate:{}", user_info.username);
+    let groups = vec![format!("warpgate:target:{target_id}")];
+    let identity = warpgate_ca::issue_kubernetes_client_identity(
+        &parameters.ca_certificate_pem,
+        &parameters.ca_private_key_pem,
+        &username,
+        &groups,
+        Duration::from_secs(u64::from(validity_seconds)),
+    )?;
+    let pem_bundle = format!(
+        "{}\n{}\n",
+        identity.certificate_pem.trim_end_matches('\n'),
+        identity.private_key_pem.trim_end_matches('\n'),
+    );
+    *cache = Some(CachedEphemeralKubernetesIdentity {
+        pem_bundle: pem_bundle.clone(),
+        not_after: identity.not_after,
+    });
+
+    Ok(pem_bundle)
 }
 
 /// True if `now` falls within the certificate's `[not_before, not_after]`
