@@ -9236,6 +9236,10 @@
             "type": "integer",
             "format": "uint32",
             "description": "Validity of each in-memory upstream certificate. The certificate is\nrenewed for an active Warpgate session before it expires."
+          },
+          "username": {
+            "type": "string",
+            "description": "Optional Kubernetes username (certificate subject CN) for every\nupstream connection to this target. When omitted, Warpgate preserves\nthe authenticated user's identity as `warpgate:<username>`."
           }
         }
       }

@@ -1085,6 +1085,7 @@ class TestKubernetesIntegration:
                                 sdk.KubernetesTargetAuthKubernetesTargetEphemeralCertificateAuth(
                                     kind="EphemeralCertificate",
                                     validity_seconds=60,
+                                    username="warpgate-test-operator",
                                 )
                             ),
                         )
@@ -1099,7 +1100,7 @@ class TestKubernetesIntegration:
                 "clusterrolebinding",
                 f"warpgate-target-{target.id}",
                 "--clusterrole=cluster-admin",
-                f"--group=warpgate:target:{target.id}",
+                "--user=warpgate-test-operator",
             ]
         )
 

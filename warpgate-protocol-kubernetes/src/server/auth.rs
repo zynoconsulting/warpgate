@@ -520,6 +520,7 @@ pub(crate) async fn create_authenticated_client(
             auth.validate().map_err(anyhow::Error::msg)?;
             let pem_bundle = ephemeral_kubernetes_client_identity(
                 auth.validity_seconds,
+                auth.username.as_deref(),
                 user_info,
                 target_id,
                 upstream_certificate_cache,
@@ -588,6 +589,7 @@ fn is_safe_to_resend(error: &(dyn std::error::Error + 'static)) -> bool {
 
 async fn ephemeral_kubernetes_client_identity(
     validity_seconds: u32,
+    configured_username: Option<&str>,
     user_info: &AuthStateUserInfo,
     target_id: Uuid,
     cache: &EphemeralKubernetesIdentityCache,
@@ -604,8 +606,14 @@ async fn ephemeral_kubernetes_client_identity(
     }
 
     let parameters = Parameters::Entity::get(&services.db).await?;
-    let username = format!("warpgate:{}", user_info.username);
-    let groups = vec![format!("warpgate:target:{target_id}")];
+    let username = configured_username
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("warpgate:{}", user_info.username));
+    let groups = if configured_username.is_some() {
+        Vec::new()
+    } else {
+        vec![format!("warpgate:target:{target_id}")]
+    };
     let identity = warpgate_ca::issue_kubernetes_client_identity(
         &parameters.ca_certificate_pem,
         &parameters.ca_private_key_pem,
