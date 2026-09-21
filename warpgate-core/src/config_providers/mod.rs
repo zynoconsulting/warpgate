@@ -7,7 +7,8 @@ mod sso_user;
 
 pub use db::DatabaseConfigProvider;
 use enum_dispatch::enum_dispatch;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::sea_query::Expr;
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Select};
 pub use sso_user::resolve_and_map_sso_user;
 use time::OffsetDateTime;
 use tracing::warn;
@@ -305,6 +306,74 @@ pub async fn authorize_for_target_by_name<C: ConfigProvider + ?Sized>(
         Some(target) => authorize_for_target(config_provider, identity, target).await,
         None => Ok(None),
     }
+}
+
+/// Apply the eligibility constraints for using a self-service ticket as a
+/// server-side authorization grant.
+///
+/// Kubernetes clients make many requests for one logical operation, so bounded
+/// ticket use counts cannot be spent safely here. Such tickets remain usable as
+/// explicit ticket credentials, but only unlimited-use tickets can authorize a
+/// separately authenticated identity.
+fn active_self_service_ticket_query(
+    query: Select<e::Ticket::Entity>,
+    user_id: Uuid,
+    target_id: Uuid,
+) -> Select<e::Ticket::Entity> {
+    let now = OffsetDateTime::now_utc();
+    query
+        .filter(e::Ticket::Column::UserId.eq(user_id))
+        .filter(e::Ticket::Column::TargetId.eq(target_id))
+        .filter(e::Ticket::Column::SelfService.eq(true))
+        .filter(e::Ticket::Column::UsesLeft.is_null())
+        .filter(
+            Expr::col(e::Ticket::Column::Expiry)
+                .is_null()
+                .or(Expr::col(e::Ticket::Column::Expiry).gt(now)),
+        )
+}
+
+async fn find_active_self_service_ticket(
+    db: &DatabaseConnection,
+    user_id: Uuid,
+    target_id: Uuid,
+) -> Result<Option<e::Ticket::Model>, WarpgateError> {
+    active_self_service_ticket_query(e::Ticket::Entity::find(), user_id, target_id)
+        .one(db)
+        .await
+        .map_err(Into::into)
+}
+
+/// Authorize a previously authenticated identity through an activated
+/// self-service ticket for the same user and target.
+///
+/// This is distinct from ticket-secret authentication: the caller proves its
+/// normal identity, while the ticket supplies only the temporary target grant.
+pub async fn authorize_active_self_service_ticket(
+    db: &DatabaseConnection,
+    user_info: AuthStateUserInfo,
+    target: Target,
+    protocol: Protocol,
+) -> Result<Option<TargetAuthorization>, WarpgateError> {
+    let ticket = find_active_self_service_ticket(db, user_info.id, target.id).await?;
+
+    Ok(ticket.map(|ticket| TargetAuthorization {
+        user_info,
+        target: SpecificTarget::any(target),
+        protocol,
+        ticket_id: Some(ticket.id),
+    }))
+}
+
+/// Re-check a server-side self-service grant so revocation and expiry apply to
+/// every request in a correlated Kubernetes session.
+pub async fn has_active_self_service_ticket(
+    db: &DatabaseConnection,
+    user_id: Uuid,
+    target_id: Uuid,
+) -> Result<bool, WarpgateError> {
+    let ticket = find_active_self_service_ticket(db, user_id, target_id).await?;
+    Ok(ticket.is_some())
 }
 
 pub async fn authorize_and_spend_ticket(
