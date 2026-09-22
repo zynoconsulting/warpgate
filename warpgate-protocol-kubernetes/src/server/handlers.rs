@@ -19,9 +19,9 @@ use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::logging::{
     get_client_ip, log_request_error, log_request_result, span_for_request,
 };
-use warpgate_core::Services;
 use warpgate_core::logging::KubernetesAuditSubject;
 use warpgate_core::recordings::{TerminalRecorder, TerminalRecordingStreamId};
+use warpgate_core::{Services, has_active_self_service_ticket};
 
 use crate::audit::{StreamOperation, classify_mutating, classify_stream};
 use crate::correlator::{AdmittedSession, RequestCorrelator, correlated_authorization};
@@ -116,6 +116,7 @@ pub async fn handle_api_request(
     // resolved once per correlated session and reused, so a single `kubectl`
     // command's fan-out of requests only prompts for approval once.
     let identity = authenticate_kubernetes_user(req, ctx.services()).await?;
+    let uses_ticket_credential = matches!(&identity, KubernetesIdentity::Ticket(_));
     let (target_name, path) = match &identity {
         // Ticket credentials select the target; the entire URI belongs to the
         // upstream API, including discovery endpoints such as /api and /version.
@@ -137,6 +138,24 @@ pub async fn handle_api_request(
 
     let (handle, admitted) =
         correlated_authorization(correlator.0, req, identity, &target_name, ctx.services()).await?;
+
+    // A normal identity authorized by a server-side ticket grant can share a
+    // correlated session, but the grant itself must not be cached. Re-check it
+    // before every request so expiry or revocation takes effect immediately.
+    if !uses_ticket_credential
+        && admitted.ticket_id().is_some()
+        && !has_active_self_service_ticket(
+            &ctx.services().db,
+            admitted.user_info().id,
+            admitted.target().id,
+        )
+        .await?
+    {
+        return Err(poem::Error::from_string(
+            format!("Access denied to target: {target_name}"),
+            poem::http::StatusCode::FORBIDDEN,
+        ));
+    }
 
     let (user_session_id, log_span) = {
         // The user info is already on the session: it is set when the session is

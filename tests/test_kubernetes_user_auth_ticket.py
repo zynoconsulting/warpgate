@@ -162,6 +162,112 @@ def test_normal_api_token_cannot_join_ticket_session(shared_wg, ticket_setup):
     assert normal_request("/api").status_code == 404
 
 
+def test_activated_request_grants_normal_identity_access(shared_wg, ticket_setup):
+    api, user, target = ticket_setup
+    api.create_password_credential(user.id, sdk.NewPasswordCredential(password="123"))
+    api.update_parameters(
+        sdk.ParameterUpdate(
+            allow_own_credential_management=True,
+            rate_limit_bytes_per_second=None,
+            ssh_client_auth_keyboard_interactive=True,
+            ssh_client_auth_password=True,
+            ssh_client_auth_publickey=True,
+            ticket_self_service_enabled=True,
+            ticket_auto_approve_existing_access=False,
+            ticket_max_uses=None,
+            ticket_require_description=True,
+            ticket_request_show_all_targets=True,
+        )
+    )
+
+    url = f"https://localhost:{shared_wg.http_port}"
+    try:
+        with requests.Session() as session:
+            session.verify = False
+            login = session.post(
+                f"{url}/@warpgate/api/auth/login",
+                json={"username": user.username, "password": "123"},
+                timeout=10,
+            )
+            login.raise_for_status()
+            token_response = session.post(
+                f"{url}/@warpgate/api/profile/api-tokens",
+                json={
+                    "label": "kubernetes-jit",
+                    "expiry": (
+                        datetime.now(timezone.utc) + timedelta(hours=1)
+                    ).isoformat(),
+                },
+                timeout=10,
+            )
+            token_response.raise_for_status()
+            headers = {"Authorization": f"Bearer {token_response.json()['secret']}"}
+            endpoint = (
+                f"https://localhost:{shared_wg.kubernetes_port}/{target.name}/version"
+            )
+
+            # The upstream credential is permanently powerful, but Warpgate has not
+            # granted this user access to the target yet.
+            denied = requests.get(
+                endpoint, headers=headers, verify=False, timeout=10
+            )
+            assert denied.status_code == 403
+
+            request_response = session.post(
+                f"{url}/@warpgate/api/ticket-requests",
+                json={
+                    "target_name": target.name,
+                    "duration_seconds": 3600,
+                    "description": "temporary Kubernetes access",
+                },
+                timeout=10,
+            )
+            request_response.raise_for_status()
+            request_id = request_response.json()["request"]["id"]
+            api.approve_ticket_request(request_id)
+
+            # Approval alone is insufficient: activation starts the access window.
+            not_activated = requests.get(
+                endpoint, headers=headers, verify=False, timeout=10
+            )
+            assert not_activated.status_code == 403
+            activation = session.post(
+                f"{url}/@warpgate/api/ticket-requests/{request_id}/activate",
+                timeout=10,
+            )
+            activation.raise_for_status()
+            ticket_id = activation.json()["request"]["ticket_id"]
+
+            allowed = requests.get(
+                endpoint, headers=headers, verify=False, timeout=10
+            )
+            assert allowed.status_code == 200, allowed.text
+            assert allowed.json()["path"] == "/version"
+
+            revoked = session.delete(
+                f"{url}/@warpgate/api/my-tickets/{ticket_id}", timeout=10
+            )
+            assert revoked.status_code == 204
+            denied_after_revocation = requests.get(
+                endpoint, headers=headers, verify=False, timeout=10
+            )
+            assert denied_after_revocation.status_code == 403
+    finally:
+        api.update_parameters(
+            sdk.ParameterUpdate(
+                allow_own_credential_management=True,
+                rate_limit_bytes_per_second=None,
+                ssh_client_auth_keyboard_interactive=True,
+                ssh_client_auth_password=True,
+                ssh_client_auth_publickey=True,
+                ticket_self_service_enabled=False,
+                ticket_auto_approve_existing_access=True,
+                ticket_require_description=False,
+                ticket_request_show_all_targets=False,
+            )
+        )
+
+
 def test_ticket_expiry_applies_to_cached_session(shared_wg, ticket_setup):
     expiry = datetime.now(timezone.utc) + timedelta(seconds=3)
     ticket = create_ticket(ticket_setup, expiry=expiry)
