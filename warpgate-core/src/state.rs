@@ -1,18 +1,21 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, broadcast, watch};
+use tokio_util::sync::DropGuard;
 use tracing::error;
 use uuid::Uuid;
 use warpgate_common::auth::AuthStateUserInfo;
 use warpgate_common::{NodeId, Protocol, Target, UserSessionId, WarpgateError};
 use warpgate_db_entities::{SessionApprovalRequest, TargetSession, UserSession};
 
+use crate::access_watch::{self, AccessGrant, AccessWatchSettings};
 use crate::rate_limiting::{RateLimiterRegistry, RateLimiterStackHandle};
 use crate::{SessionHandle, WarpgateServerHandle};
 
@@ -22,6 +25,13 @@ pub struct State {
     node_id: NodeId,
     rate_limiter_registry: Arc<Mutex<RateLimiterRegistry>>,
     change_sender: broadcast::Sender<()>,
+    /// Nudges every access watcher (see [`crate::access_watch`]) to re-check
+    /// its grant immediately instead of waiting out its interval — sent on a
+    /// ticket revoke so a session ends promptly rather than up to
+    /// `access_watch_interval` late.
+    access_watch_nudges: Arc<watch::Sender<u64>>,
+    access_watch_interval: Duration,
+    access_watch_unconfirmed_limit: Duration,
 }
 
 impl State {
@@ -37,7 +47,26 @@ impl State {
             node_id,
             rate_limiter_registry: rate_limiter_registry.clone(),
             change_sender: sender,
+            access_watch_nudges: Arc::new(watch::channel(0u64).0),
+            access_watch_interval: access_watch::DEFAULT_INTERVAL,
+            access_watch_unconfirmed_limit: access_watch::DEFAULT_UNCONFIRMED_LIMIT,
         }))
+    }
+
+    /// Wakes every access watcher on this node so it re-checks its grant now
+    /// instead of on its next poll. Called when a ticket is deleted, so a
+    /// revoke closes its sessions promptly rather than up to one interval
+    /// late.
+    pub fn nudge_access_watchers(&self) {
+        self.access_watch_nudges.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// Speeds up access-watch polling for a test, so it does not have to wait
+    /// out the production interval.
+    #[cfg(test)]
+    pub(crate) fn set_access_watch_timing(&mut self, interval: Duration, unconfirmed_limit: Duration) {
+        self.access_watch_interval = interval;
+        self.access_watch_unconfirmed_limit = unconfirmed_limit;
     }
 
     /// Registers a session with no owning node: it is a DB record any node
@@ -169,6 +198,11 @@ impl State {
     ) -> Arc<Mutex<WarpgateServerHandle>> {
         self.user_sessions.insert(id, state.clone());
         let _ = self.change_sender.send(());
+        let access_watch = AccessWatchSettings {
+            interval: self.access_watch_interval,
+            unconfirmed_limit: self.access_watch_unconfirmed_limit,
+            nudges: self.access_watch_nudges.subscribe(),
+        };
         Arc::new(Mutex::new(WarpgateServerHandle::new(
             id,
             self.db.clone(),
@@ -178,6 +212,7 @@ impl State {
             protocol,
             node_owned,
             self.node_id,
+            access_watch,
         )))
     }
 
@@ -283,6 +318,36 @@ impl SharedSessionHandle {
             Err(error) => error!(%error, "Could not lock session close handle"),
         }
     }
+
+    /// A weak view for a task that must not keep the underlying handle (and
+    /// whatever it owns — e.g. a protocol's `abort_tx`) alive by itself. An
+    /// access watcher holds this instead of a [`SharedSessionHandle`]: once
+    /// every real owner is gone the handle drops and tears down promptly,
+    /// rather than lingering until the watcher's grant also goes dead.
+    pub(crate) fn downgrade(&self) -> WeakSessionHandle {
+        WeakSessionHandle {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct WeakSessionHandle {
+    inner: Weak<std::sync::Mutex<Box<dyn SessionHandle + Send + Sync>>>,
+}
+
+impl WeakSessionHandle {
+    /// Closes the session if it still exists. A handle that is already gone
+    /// (torn down through some other path) is not an error to observe here.
+    pub(crate) fn close(&self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        match inner.lock() {
+            Ok(mut handle) => handle.close(),
+            Err(error) => error!(%error, "Could not lock session close handle"),
+        }
+    }
 }
 
 pub struct UserSessionState {
@@ -295,6 +360,11 @@ pub struct UserSessionState {
     pub target: Option<Target>,
     change_sender: broadcast::Sender<()>,
     pub rate_limiter_handles: Vec<RateLimiterStackHandle>,
+    /// One [`access_watch::watch`] task per distinct grant admitted under in
+    /// this node-local session state. Dropping the guard cancels the
+    /// watcher; the whole map drops with this state, so no watcher outlives
+    /// the session it watches.
+    pub(crate) access_watches: HashMap<AccessGrant, DropGuard>,
 }
 
 pub struct UserSessionStateInit {
@@ -311,6 +381,7 @@ impl UserSessionState {
             target: None,
             change_sender,
             rate_limiter_handles: vec![],
+            access_watches: HashMap::new(),
         }
     }
 
@@ -321,6 +392,9 @@ impl UserSessionState {
 
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use sea_orm::ActiveValue::Set;
     use sea_orm::{ColumnTrait, Database, PaginatorTrait, QueryFilter};
     use warpgate_common::{TargetHTTPOptions, TargetOptions, Tls, UserSessionId};
     use warpgate_db_entities::Parameters::{ConfigMigrationValues, set_config_migration_values};
@@ -913,5 +987,550 @@ mod tests {
             .started()
             .id();
         assert_eq!(again_id, target_session_id);
+    }
+
+    /// A [`SessionHandle`] that counts its `close()` calls instead of acting
+    /// on them, so a test can observe whether — and how many times — the
+    /// access watcher closed the session.
+    #[derive(Clone, Default)]
+    struct CountingHandle(Arc<AtomicUsize>);
+
+    impl SessionHandle for CountingHandle {
+        fn close(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Inserts a user, the given (ungated) HTTP target, and a ticket binding
+    /// them — modeled on `approvals::tests::ticket_with_uses`, but returning
+    /// what a [`crate::TargetAuthorization::for_ticket_session`] needs, since
+    /// these tests check admission rather than the approval gate.
+    async fn insert_ticket(
+        db: &DatabaseConnection,
+        access_target: &Target,
+        expiry: Option<OffsetDateTime>,
+        uses_left: Option<i16>,
+    ) -> (AuthStateUserInfo, Uuid) {
+        let user_id = Uuid::new_v4();
+        warpgate_db_entities::User::Entity::insert(warpgate_db_entities::User::ActiveModel {
+            id: Set(user_id),
+            username: Set("alice".into()),
+            credential_policy: Set(serde_json::Value::Null),
+            description: Set(String::new()),
+            rate_limit_bytes_per_second: Set(None),
+            ldap_server_id: Set(None),
+            ldap_object_uuid: Set(None),
+            allowed_ip_ranges: Set(serde_json::Value::Null),
+        })
+        .exec(db)
+        .await
+        .unwrap();
+
+        warpgate_db_entities::Target::Entity::insert(warpgate_db_entities::Target::ActiveModel {
+            id: Set(access_target.id),
+            name: Set(access_target.name.clone()),
+            description: Set(String::new()),
+            kind: Set(warpgate_db_entities::Target::TargetKind::Http),
+            options: Set(serde_json::to_value(&access_target.options).unwrap()),
+            rate_limit_bytes_per_second: Set(None),
+            group_id: Set(None),
+            ticket_max_duration_seconds: Set(None),
+            ticket_requests_disabled: Set(false),
+            ticket_require_approval: Set(false),
+            ticket_max_uses: Set(None),
+            require_approval: Set(false),
+        })
+        .exec(db)
+        .await
+        .unwrap();
+
+        let ticket_id = Uuid::new_v4();
+        warpgate_db_entities::Ticket::Entity::insert(warpgate_db_entities::Ticket::ActiveModel {
+            id: Set(ticket_id),
+            secret_hash: Set("hash".into()),
+            user_id: Set(user_id),
+            description: Set(String::new()),
+            target_id: Set(access_target.id),
+            uses_left: Set(uses_left),
+            self_service: Set(false),
+            expiry: Set(expiry),
+            created: Set(OffsetDateTime::now_utc()),
+        })
+        .exec(db)
+        .await
+        .unwrap();
+
+        (
+            AuthStateUserInfo {
+                id: user_id,
+                username: "alice".into(),
+            },
+            ticket_id,
+        )
+    }
+
+    /// A fresh migrated DB plus a `State` with the access-watch poll timing
+    /// sped up, so a test doesn't have to wait out the production interval.
+    async fn state_with_watch_timing(
+        interval: Duration,
+        unconfirmed_limit: Duration,
+    ) -> (DatabaseConnection, Arc<Mutex<State>>) {
+        set_config_migration_values(ConfigMigrationValues::default());
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        migrate_database(&db).await.unwrap();
+        let rate_limiters = Arc::new(Mutex::new(RateLimiterRegistry::new(db.clone())));
+        let state = State::new(&db, &rate_limiters, NodeId(Uuid::new_v4()));
+        state
+            .lock()
+            .await
+            .set_access_watch_timing(interval, unconfirmed_limit);
+        (db, state)
+    }
+
+    /// A ticket revoked (or never valid) before admission must refuse the
+    /// session outright — no target session row, no watcher — rather than
+    /// admitting it and relying on the watcher to close it moments later.
+    #[tokio::test]
+    async fn admission_refuses_revoked_ticket_and_opens_no_row() {
+        let (db, state) = state_with_watch_timing(Duration::from_secs(3600), Duration::from_secs(3600)).await;
+        let access_target = target();
+        let (user_info, ticket_id) = insert_ticket(&db, &access_target, None, None).await;
+        warpgate_db_entities::Ticket::Entity::delete_by_id(ticket_id)
+            .exec(&db)
+            .await
+            .unwrap();
+
+        let parent = State::register_nonlocal_user_session(
+            &state,
+            Protocol::Http,
+            UserSessionStateInit {
+                remote_address: None,
+                handle: Box::new(TestHandle),
+            },
+        )
+        .await
+        .unwrap();
+        let parent_id = parent.lock().await.user_session_id();
+
+        let refused = parent
+            .lock()
+            .await
+            .start_target_session(
+                crate::TargetAuthorization::for_ticket_session(
+                    user_info,
+                    access_target,
+                    ticket_id,
+                    Protocol::Http,
+                )
+                .unwrap(),
+            )
+            .await;
+        assert!(matches!(refused, Err(WarpgateError::TargetAccessRevoked)));
+
+        assert_eq!(
+            TargetSession::Entity::find()
+                .filter(TargetSession::Column::UserSessionId.eq(parent_id))
+                .count(&db)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            parent
+                .lock()
+                .await
+                .user_session_state()
+                .lock()
+                .await
+                .access_watches
+                .len(),
+            0
+        );
+    }
+
+    /// Same refusal for a ticket that exists but whose own expiry has
+    /// already passed.
+    #[tokio::test]
+    async fn admission_refuses_expired_ticket() {
+        let (db, state) = state_with_watch_timing(Duration::from_secs(3600), Duration::from_secs(3600)).await;
+        let access_target = target();
+        let past = OffsetDateTime::now_utc() - time::Duration::seconds(60);
+        let (user_info, ticket_id) = insert_ticket(&db, &access_target, Some(past), None).await;
+
+        let parent = State::register_nonlocal_user_session(
+            &state,
+            Protocol::Http,
+            UserSessionStateInit {
+                remote_address: None,
+                handle: Box::new(TestHandle),
+            },
+        )
+        .await
+        .unwrap();
+        let parent_id = parent.lock().await.user_session_id();
+
+        let refused = parent
+            .lock()
+            .await
+            .start_target_session(
+                crate::TargetAuthorization::for_ticket_session(
+                    user_info,
+                    access_target,
+                    ticket_id,
+                    Protocol::Http,
+                )
+                .unwrap(),
+            )
+            .await;
+        assert!(matches!(refused, Err(WarpgateError::TargetAccessRevoked)));
+        assert_eq!(
+            TargetSession::Entity::find()
+                .filter(TargetSession::Column::UserSessionId.eq(parent_id))
+                .count(&db)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    /// Exhausting a ticket's uses must never close a session already
+    /// admitted under it — only block a *new* admission. `uses_left` is
+    /// deliberately not part of the watcher's liveness check.
+    #[tokio::test]
+    async fn exhausted_uses_do_not_close() {
+        let (db, state) =
+            state_with_watch_timing(Duration::from_millis(30), Duration::from_millis(90)).await;
+        let access_target = target();
+        let (user_info, ticket_id) = insert_ticket(&db, &access_target, None, Some(0)).await;
+
+        let closes = Arc::new(AtomicUsize::new(0));
+        let parent = State::register_nonlocal_user_session(
+            &state,
+            Protocol::Http,
+            UserSessionStateInit {
+                remote_address: None,
+                handle: Box::new(CountingHandle(closes.clone())),
+            },
+        )
+        .await
+        .unwrap();
+
+        let admitted = parent
+            .lock()
+            .await
+            .start_target_session(
+                crate::TargetAuthorization::for_ticket_session(
+                    user_info,
+                    access_target,
+                    ticket_id,
+                    Protocol::Http,
+                )
+                .unwrap(),
+            )
+            .await;
+        assert!(admitted.is_ok(), "an exhausted ticket still admits");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(closes.load(Ordering::SeqCst), 0);
+    }
+
+    /// Deleting a ticket (revoking it) closes the session it authorized, on
+    /// the watcher's next poll.
+    #[tokio::test]
+    async fn deleting_ticket_closes_session() {
+        let (db, state) =
+            state_with_watch_timing(Duration::from_millis(50), Duration::from_millis(150)).await;
+        let access_target = target();
+        let (user_info, ticket_id) = insert_ticket(&db, &access_target, None, None).await;
+
+        let closes = Arc::new(AtomicUsize::new(0));
+        let parent = State::register_nonlocal_user_session(
+            &state,
+            Protocol::Http,
+            UserSessionStateInit {
+                remote_address: None,
+                handle: Box::new(CountingHandle(closes.clone())),
+            },
+        )
+        .await
+        .unwrap();
+        parent
+            .lock()
+            .await
+            .start_target_session(
+                crate::TargetAuthorization::for_ticket_session(
+                    user_info,
+                    access_target,
+                    ticket_id,
+                    Protocol::Http,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .started();
+
+        warpgate_db_entities::Ticket::Entity::delete_by_id(ticket_id)
+            .exec(&db)
+            .await
+            .unwrap();
+
+        for _ in 0..50 {
+            if closes.load(Ordering::SeqCst) > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("session was not closed after its ticket was deleted");
+    }
+
+    /// With a long poll interval, a ticket's own expiry still closes the
+    /// session right on the deadline, not on the next (much later) periodic
+    /// poll — the watcher sleeps to the sooner of the two.
+    #[tokio::test]
+    async fn expiry_closes_at_deadline_not_poll() {
+        let (db, state) =
+            state_with_watch_timing(Duration::from_secs(3600), Duration::from_secs(3600)).await;
+        let access_target = target();
+        let expiry = OffsetDateTime::now_utc() + time::Duration::milliseconds(300);
+        let (user_info, ticket_id) = insert_ticket(&db, &access_target, Some(expiry), None).await;
+
+        let closes = Arc::new(AtomicUsize::new(0));
+        let parent = State::register_nonlocal_user_session(
+            &state,
+            Protocol::Http,
+            UserSessionStateInit {
+                remote_address: None,
+                handle: Box::new(CountingHandle(closes.clone())),
+            },
+        )
+        .await
+        .unwrap();
+        parent
+            .lock()
+            .await
+            .start_target_session(
+                crate::TargetAuthorization::for_ticket_session(
+                    user_info,
+                    access_target,
+                    ticket_id,
+                    Protocol::Http,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .started();
+
+        for _ in 0..100 {
+            if closes.load(Ordering::SeqCst) > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("session was not closed at its ticket's expiry deadline");
+    }
+
+    /// A revoke nudges every watcher to re-check immediately, so a session
+    /// closes right away even with a poll interval far longer than the test
+    /// itself.
+    #[tokio::test]
+    async fn nudge_rechecks_immediately() {
+        let (db, state) =
+            state_with_watch_timing(Duration::from_secs(3600), Duration::from_secs(3600)).await;
+        let access_target = target();
+        let (user_info, ticket_id) = insert_ticket(&db, &access_target, None, None).await;
+
+        let closes = Arc::new(AtomicUsize::new(0));
+        let parent = State::register_nonlocal_user_session(
+            &state,
+            Protocol::Http,
+            UserSessionStateInit {
+                remote_address: None,
+                handle: Box::new(CountingHandle(closes.clone())),
+            },
+        )
+        .await
+        .unwrap();
+        parent
+            .lock()
+            .await
+            .start_target_session(
+                crate::TargetAuthorization::for_ticket_session(
+                    user_info,
+                    access_target,
+                    ticket_id,
+                    Protocol::Http,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .started();
+
+        warpgate_db_entities::Ticket::Entity::delete_by_id(ticket_id)
+            .exec(&db)
+            .await
+            .unwrap();
+        state.lock().await.nudge_access_watchers();
+
+        for _ in 0..25 {
+            if closes.load(Ordering::SeqCst) > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("nudged session was not closed within 500ms");
+    }
+
+    /// Repeated admissions under the same grant (another HTTP request,
+    /// another `kubectl` call) must reuse one watcher, not spawn a new one
+    /// each time.
+    #[tokio::test]
+    async fn repeated_admissions_share_one_watcher() {
+        let (db, state) =
+            state_with_watch_timing(Duration::from_secs(3600), Duration::from_secs(3600)).await;
+        let access_target = target();
+        let (user_info, ticket_id) = insert_ticket(&db, &access_target, None, None).await;
+
+        let parent = State::register_nonlocal_user_session(
+            &state,
+            Protocol::Http,
+            UserSessionStateInit {
+                remote_address: None,
+                handle: Box::new(TestHandle),
+            },
+        )
+        .await
+        .unwrap();
+
+        for _ in 0..2 {
+            parent
+                .lock()
+                .await
+                .start_target_session(
+                    crate::TargetAuthorization::for_ticket_session(
+                        user_info.clone(),
+                        access_target.clone(),
+                        ticket_id,
+                        Protocol::Http,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                .started();
+        }
+
+        let session_state = parent.lock().await.user_session_state().clone();
+        assert_eq!(session_state.lock().await.access_watches.len(), 1);
+    }
+
+    /// An authorization with no backing grant (role-based access) starts no
+    /// watcher: nothing revokes it mid-session today.
+    #[tokio::test]
+    async fn non_ticket_admission_starts_no_watcher() {
+        let (_db, state) =
+            state_with_watch_timing(Duration::from_secs(3600), Duration::from_secs(3600)).await;
+        let access_target = target();
+        let user_info = AuthStateUserInfo {
+            id: Uuid::new_v4(),
+            username: "alice".into(),
+        };
+
+        let parent = State::register_nonlocal_user_session(
+            &state,
+            Protocol::Http,
+            UserSessionStateInit {
+                remote_address: None,
+                handle: Box::new(TestHandle),
+            },
+        )
+        .await
+        .unwrap();
+        parent
+            .lock()
+            .await
+            .start_target_session(crate::TargetAuthorization::for_test(
+                user_info,
+                access_target,
+                Protocol::Http,
+            ))
+            .await
+            .unwrap()
+            .started();
+
+        let session_state = parent.lock().await.user_session_state().clone();
+        assert_eq!(session_state.lock().await.access_watches.len(), 0);
+    }
+
+    /// Dropping the last handle of the session (ending it) must stop its
+    /// watcher: after the session and its `UserSessionState` are gone, a
+    /// later revoke-and-nudge must not still land a `close()` — there is
+    /// nothing left to close, and nothing should still be polling to try.
+    #[tokio::test]
+    async fn dropping_session_cancels_watcher() {
+        let (db, state) =
+            state_with_watch_timing(Duration::from_millis(20), Duration::from_millis(60)).await;
+        let access_target = target();
+        let (user_info, ticket_id) = insert_ticket(&db, &access_target, None, None).await;
+
+        let closes = Arc::new(AtomicUsize::new(0));
+        let parent = State::register_nonlocal_user_session(
+            &state,
+            Protocol::Http,
+            UserSessionStateInit {
+                remote_address: None,
+                handle: Box::new(CountingHandle(closes.clone())),
+            },
+        )
+        .await
+        .unwrap();
+        let parent_id = parent.lock().await.user_session_id();
+        parent
+            .lock()
+            .await
+            .start_target_session(
+                crate::TargetAuthorization::for_ticket_session(
+                    user_info,
+                    access_target,
+                    ticket_id,
+                    Protocol::Http,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .started();
+
+        drop(parent);
+
+        // Teardown runs on a spawned task; poll until the row is ended and
+        // the node-local state has been dropped from the map (its only other
+        // owner) — i.e. until nothing should be watching any more.
+        for _ in 0..50 {
+            let ended = UserSession::Entity::find_by_id(parent_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .map(|row| row.ended.is_some())
+                .unwrap_or(false);
+            if ended && !state.lock().await.user_sessions.contains_key(&parent_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!state.lock().await.user_sessions.contains_key(&parent_id));
+
+        // If the watcher were somehow still running, this would wake it
+        // immediately instead of waiting out an interval.
+        warpgate_db_entities::Ticket::Entity::delete_by_id(ticket_id)
+            .exec(&db)
+            .await
+            .unwrap();
+        state.lock().await.nudge_access_watchers();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(closes.load(Ordering::SeqCst), 0);
     }
 }
