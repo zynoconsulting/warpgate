@@ -43,7 +43,7 @@ fn public_keys_match(stored_public_key: &str, presented_public_key: &str) -> boo
 }
 
 #[cfg(test)]
-mod tests {
+mod public_key_tests {
     use super::public_keys_match;
 
     #[test]
