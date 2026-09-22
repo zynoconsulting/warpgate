@@ -20,7 +20,8 @@ use warpgate_common_http::logging::get_client_ip_addr;
 use warpgate_core::login_protection::FailedAttemptInfo;
 use warpgate_core::{
     AuthorizedIdentity, ConfigProvider, Services, TargetAuthorization, ValidatedTicket,
-    authorize_for_target, validate_ticket, vet_credential_bearer, wait_for_auth_completion,
+    authorize_active_self_service_ticket, authorize_for_target, validate_ticket,
+    vet_credential_bearer, wait_for_auth_completion,
 };
 use warpgate_db_entities::{CertificateCredential, CertificateRevocation, Parameters};
 
@@ -186,13 +187,37 @@ pub async fn authorize_kubernetes_target(
     session_id: UserSessionId,
     services: &Services,
 ) -> poem::Result<TargetAuthorization<TargetKubernetesOptions>> {
+    let target = lookup_kubernetes_target(services.config_provider.as_ref(), target_name).await?;
+
+    // Activation is the explicit approval step. The client continues to prove
+    // its normal identity; the active ticket supplies temporary target access.
+    if let Some(authorization) = authorize_active_self_service_ticket(
+        &services.db,
+        user.into(),
+        target.clone(),
+        crate::PROTOCOL_NAME,
+    )
+    .await?
+    {
+        return authorization.narrow().map_err(Into::into);
+    }
+
     let client_ip = get_client_ip_addr(req, services).await;
 
     // When the user has a Kubernetes credential policy, enforce its web-approval
     // factor on top of the transport identity; otherwise use the identity directly.
     let identity =
         authorize_kubernetes_identity(services, user, client_ip, target_name, session_id).await?;
-    lookup_authorized_k8s_target(services.config_provider.as_ref(), target_name, &identity).await
+    authorize_for_target(services.config_provider.as_ref(), &identity, target)
+        .await?
+        .ok_or_else(|| {
+            poem::Error::from_string(
+                format!("Access denied to target: {target_name}"),
+                poem::http::StatusCode::FORBIDDEN,
+            )
+        })?
+        .narrow()
+        .map_err(Into::into)
 }
 
 /// Turn a validated Kubernetes identity into an [`AuthorizedIdentity`], applying
@@ -393,35 +418,29 @@ async fn authenticate(req: &Request, services: &Services) -> poem::Result<Option
     Ok(None)
 }
 
-/// Look up a Kubernetes target by name and prove the user is authorized for it.
-/// Shared by the API-token, OIDC and client-certificate auth paths.
-async fn lookup_authorized_k8s_target<C: ConfigProvider + Send>(
+/// Look up a Kubernetes target before authorizing it through either a role or
+/// an activated self-service ticket.
+async fn lookup_kubernetes_target<C: ConfigProvider + Send>(
     config_provider: &C,
     target_name: &str,
-    identity: &AuthorizedIdentity,
-) -> poem::Result<TargetAuthorization<TargetKubernetesOptions>> {
+) -> poem::Result<warpgate_common::Target> {
     let not_found = || {
         poem::Error::from_string(
             format!("Kubernetes target not found: {target_name}"),
             poem::http::StatusCode::NOT_FOUND,
         )
     };
-    let target = config_provider
+    config_provider
         .get_target_by_name(target_name)
         .await
         .context("looking up target")?
-        .ok_or_else(not_found)?;
-
-    authorize_for_target(config_provider, identity, target)
-        .await?
-        .ok_or_else(|| {
-            poem::Error::from_string(
-                format!("Access denied to target: {target_name}"),
-                poem::http::StatusCode::FORBIDDEN,
+        .filter(|target| {
+            matches!(
+                &target.options,
+                warpgate_common::TargetOptions::Kubernetes(_)
             )
-        })?
-        .narrow()
-        .map_err(|_| not_found())
+        })
+        .ok_or_else(not_found)
 }
 
 /// Load a resolved SSO user by username.
