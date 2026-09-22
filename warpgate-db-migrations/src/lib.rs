@@ -4,6 +4,10 @@ use sea_orm::{DatabaseBackend, DatabaseConnection, TransactionTrait};
 use sea_orm_migration::MigrationTrait;
 use sea_orm_migration::prelude::*;
 
+#[path = "m00078_fix_credential_policy_publickey.rs"]
+mod legacy_m00078_fix_credential_policy_publickey;
+#[path = "m00083_fix_credential_policy_publickey.rs"]
+mod legacy_m00083_fix_credential_policy_publickey;
 mod m00001_create_ticket;
 mod m00002_create_session;
 mod m00003_create_recording;
@@ -179,11 +183,13 @@ impl MigratorTrait for Migrator {
             Box::new(m00075_hash_ticket_and_api_token_secrets::Migration),
             Box::new(m00076_open_targets_in_new_tab::Migration),
             Box::new(m00077_session_user_target_id::Migration),
+            Box::new(legacy_m00078_fix_credential_policy_publickey::Migration),
             Box::new(m00078_assignment_composite_pks::Migration),
             Box::new(m00079_unique_target_and_group_names::Migration),
             Box::new(m00080_user_and_target_sessions::Migration),
             Box::new(m00081_http_session_user_session_id::Migration),
             Box::new(m00082_target_session_columns::Migration),
+            Box::new(legacy_m00083_fix_credential_policy_publickey::Migration),
             Box::new(m00083_record_desktop_keyboard_input::Migration),
             Box::new(m00084_mfa_enforcement::Migration),
             Box::new(m00085_default_credential_policy::Migration),
@@ -303,9 +309,52 @@ async fn run<'c, C: IntoSchemaManagerConnection<'c>>(
 #[cfg(test)]
 mod tests {
     use sea_orm::{ConnectOptions, Database};
+    use sea_orm_migration::{MigrationName, MigratorTrait};
     use warpgate_db_entities::Parameters::{ConfigMigrationValues, set_config_migration_values};
 
-    use super::{migrate_database, migrate_database_down, migrate_database_up};
+    use super::{
+        Migrator, legacy_m00078_fix_credential_policy_publickey,
+        legacy_m00083_fix_credential_policy_publickey, migrate_database, migrate_database_down,
+        migrate_database_up,
+    };
+
+    #[test]
+    fn retains_historical_credential_policy_migration_names_in_order() {
+        let migration_78 = legacy_m00078_fix_credential_policy_publickey::Migration;
+        let migration_83 = legacy_m00083_fix_credential_policy_publickey::Migration;
+        assert_eq!(
+            migration_78.name(),
+            "m00078_fix_credential_policy_publickey"
+        );
+        assert_eq!(
+            migration_83.name(),
+            "m00083_fix_credential_policy_publickey"
+        );
+
+        let names: Vec<String> = Migrator::migrations()
+            .iter()
+            .map(|migration| migration.name().to_owned())
+            .collect();
+        let position = |name| {
+            names
+                .iter()
+                .position(|candidate| candidate == name)
+                .unwrap()
+        };
+
+        assert!(
+            position("m00078_fix_credential_policy_publickey")
+                < position("m00078_assignment_composite_pks")
+        );
+        assert!(
+            position("m00083_fix_credential_policy_publickey")
+                < position("m00083_record_desktop_keyboard_input")
+        );
+        assert!(
+            position("m00083_fix_credential_policy_publickey")
+                < position("m00089_fix_credential_policy_publickey")
+        );
+    }
 
     /// The full chain, and a step back and forth, through a pooled file-backed
     /// SQLite connection - the shape a real install uses.
