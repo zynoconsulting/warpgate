@@ -29,6 +29,13 @@ fn serialize_options_for_storage(
     Ok(value)
 }
 
+fn validate_target_options(options: &TargetOptions) -> Result<(), String> {
+    if let TargetOptions::Kubernetes(options) = options {
+        options.validate()?;
+    }
+    Ok(())
+}
+
 #[derive(Object)]
 struct TargetDataRequest {
     name: String,
@@ -127,6 +134,9 @@ impl ListApi {
                 "name",
                 "target name is empty",
             )));
+        }
+        if let Err(error) = validate_target_options(&body.options) {
+            return Ok(CreateTargetResponse::BadRequest(Json(error)));
         }
 
         let db = &admin.services().db;
@@ -248,6 +258,9 @@ impl DetailApi {
                 target = %target.name,
                 "Rejecting request: a target's protocol cannot be changed after creation"
             );
+            return Ok(UpdateTargetResponse::BadRequest);
+        }
+        if validate_target_options(&body.options).is_err() {
             return Ok(UpdateTargetResponse::BadRequest);
         }
 

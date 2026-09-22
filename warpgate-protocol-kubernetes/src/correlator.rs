@@ -14,7 +14,9 @@ use warpgate_core::{
     WarpgateServerHandle,
 };
 
-use crate::server::auth::{KubernetesIdentity, authorize_kubernetes_target, unauthorized};
+use crate::server::auth::{
+    EphemeralKubernetesIdentityCache, KubernetesIdentity, authorize_kubernetes_target, unauthorized,
+};
 use crate::session_handle::KubernetesSessionHandle;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -47,7 +49,32 @@ impl CorrelationKey {
 /// This is just long enough to cover a burst of API requests from a single kubectl
 const REFUSAL_MEMORY: Duration = Duration::from_secs(5);
 
-pub type AdmittedSession = Arc<AdmittedTarget<TargetKubernetesOptions>>;
+#[derive(Clone)]
+pub struct AdmittedSession {
+    admitted: Arc<AdmittedTarget<TargetKubernetesOptions>>,
+    upstream_certificate_cache: EphemeralKubernetesIdentityCache,
+}
+
+impl AdmittedSession {
+    fn new(admitted: AdmittedTarget<TargetKubernetesOptions>) -> Self {
+        Self {
+            admitted: Arc::new(admitted),
+            upstream_certificate_cache: EphemeralKubernetesIdentityCache::default(),
+        }
+    }
+
+    pub const fn upstream_certificate_cache(&self) -> &EphemeralKubernetesIdentityCache {
+        &self.upstream_certificate_cache
+    }
+}
+
+impl std::ops::Deref for AdmittedSession {
+    type Target = AdmittedTarget<TargetKubernetesOptions>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.admitted
+    }
+}
 
 /// The outcome of the request that opened one correlated session. Requests that
 /// join a session in flight wait on the mutex, so a `kubectl` command's fan-out
@@ -168,7 +195,7 @@ pub async fn correlated_authorization(
             Ok(resolved) => {
                 let admitted =
                     match admit_kubernetes_session(request, services, &handle, resolved).await {
-                        Ok(admitted) => Arc::new(admitted),
+                        Ok(admitted) => AdmittedSession::new(admitted),
                         Err(error) => {
                             *authorization = Authorization::Denied;
                             {

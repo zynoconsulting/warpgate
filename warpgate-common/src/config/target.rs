@@ -13,6 +13,10 @@ use super::defaults::{
 use crate::encryption::EncryptionError;
 use crate::{Protocol, Secret, StoredSecret};
 
+pub const KUBERNETES_EPHEMERAL_CERTIFICATE_DEFAULT_VALIDITY_SECONDS: u32 = 5 * 60;
+pub const KUBERNETES_EPHEMERAL_CERTIFICATE_MIN_VALIDITY_SECONDS: u32 = 60;
+pub const KUBERNETES_EPHEMERAL_CERTIFICATE_MAX_VALIDITY_SECONDS: u32 = 10 * 60;
+
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Object)]
 pub struct KubernetesTargetCertificateAuth {
     pub certificate: Secret<String>,
@@ -340,6 +344,8 @@ pub enum KubernetesTargetAuth {
     Certificate(KubernetesTargetCertificateAuth),
     #[serde(rename = "iam_role")]
     IamRole(KubernetesTargetIamRoleAuth),
+    #[serde(rename = "ephemeral_certificate")]
+    EphemeralCertificate(KubernetesTargetEphemeralCertificateAuth),
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Object)]
@@ -349,6 +355,67 @@ pub struct KubernetesTargetTokenAuth {
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Object, Default)]
 pub struct KubernetesTargetIamRoleAuth {}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Object)]
+pub struct KubernetesTargetEphemeralCertificateAuth {
+    /// Validity of each in-memory upstream certificate. The certificate is
+    /// renewed for an active Warpgate session before it expires.
+    #[serde(default = "_default_kubernetes_ephemeral_certificate_validity_seconds")]
+    pub validity_seconds: u32,
+
+    /// Optional Kubernetes username (certificate subject CN) for every
+    /// upstream connection to this target. When omitted, Warpgate preserves
+    /// the authenticated user's identity as `warpgate:<username>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+}
+
+fn _default_kubernetes_ephemeral_certificate_validity_seconds() -> u32 {
+    KUBERNETES_EPHEMERAL_CERTIFICATE_DEFAULT_VALIDITY_SECONDS
+}
+
+impl Default for KubernetesTargetEphemeralCertificateAuth {
+    fn default() -> Self {
+        Self {
+            validity_seconds: KUBERNETES_EPHEMERAL_CERTIFICATE_DEFAULT_VALIDITY_SECONDS,
+            username: None,
+        }
+    }
+}
+
+impl KubernetesTargetEphemeralCertificateAuth {
+    pub fn validate(&self) -> Result<(), String> {
+        if (KUBERNETES_EPHEMERAL_CERTIFICATE_MIN_VALIDITY_SECONDS
+            ..=KUBERNETES_EPHEMERAL_CERTIFICATE_MAX_VALIDITY_SECONDS)
+            .contains(&self.validity_seconds)
+        {
+            if let Some(username) = &self.username
+                && (username.trim().is_empty() || username.starts_with("system:"))
+            {
+                return Err(
+                    "Kubernetes ephemeral certificate username must be non-empty and must not start with `system:`"
+                        .to_string(),
+                );
+            }
+            return Ok(());
+        }
+
+        Err(format!(
+            "Kubernetes ephemeral certificate validity must be between {} and {} seconds",
+            KUBERNETES_EPHEMERAL_CERTIFICATE_MIN_VALIDITY_SECONDS,
+            KUBERNETES_EPHEMERAL_CERTIFICATE_MAX_VALIDITY_SECONDS,
+        ))
+    }
+}
+
+impl TargetKubernetesOptions {
+    pub fn validate(&self) -> Result<(), String> {
+        if let KubernetesTargetAuth::EphemeralCertificate(auth) = &self.auth {
+            auth.validate()?;
+        }
+        Ok(())
+    }
+}
 
 impl Default for KubernetesTargetAuth {
     fn default() -> Self {
@@ -469,9 +536,11 @@ pub fn redact_target_secrets(value: &mut serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DatabaseTargetAuth, DatabaseTargetPasswordAuth, PostgresProtocolVersion,
-        RdpTargetCompression, RdpTlsSecurity, TargetHTTPOptions, TargetKubernetesOptions,
-        TargetMySqlOptions, TargetPostgresOptions, TargetRdpOptions, TargetSSHOptions, Tls,
+        DatabaseTargetAuth, DatabaseTargetPasswordAuth,
+        KUBERNETES_EPHEMERAL_CERTIFICATE_DEFAULT_VALIDITY_SECONDS, KubernetesTargetAuth,
+        KubernetesTargetEphemeralCertificateAuth, PostgresProtocolVersion, RdpTargetCompression,
+        RdpTlsSecurity, TargetHTTPOptions, TargetKubernetesOptions, TargetMySqlOptions,
+        TargetPostgresOptions, TargetRdpOptions, TargetSSHOptions, Tls,
     };
 
     /// The two ways of saying "nothing specified" — an absent `tls` block and an
@@ -524,6 +593,41 @@ mod tests {
             serde_json::from_str(r#"{"url":"http://t","tls":{"verify":false}}"#).unwrap();
 
         assert!(!off.tls.verify);
+    }
+
+    #[test]
+    fn ephemeral_kubernetes_certificate_validity_is_bounded() {
+        let default_auth = KubernetesTargetEphemeralCertificateAuth::default();
+        assert_eq!(
+            default_auth.validity_seconds,
+            KUBERNETES_EPHEMERAL_CERTIFICATE_DEFAULT_VALIDITY_SECONDS
+        );
+        assert!(default_auth.validate().is_ok());
+
+        let too_short = KubernetesTargetEphemeralCertificateAuth {
+            validity_seconds: 59,
+            username: None,
+        };
+        assert!(too_short.validate().is_err());
+
+        let too_long = KubernetesTargetEphemeralCertificateAuth {
+            validity_seconds: 601,
+            username: None,
+        };
+        assert!(too_long.validate().is_err());
+
+        let reserved_username = KubernetesTargetEphemeralCertificateAuth {
+            validity_seconds: 300,
+            username: Some("system:admin".to_string()),
+        };
+        assert!(reserved_username.validate().is_err());
+
+        let options = TargetKubernetesOptions {
+            cluster_url: "https://kubernetes.example.com".to_string(),
+            tls: Tls::default(),
+            auth: KubernetesTargetAuth::EphemeralCertificate(too_short),
+        };
+        assert!(options.validate().is_err());
     }
 
     fn wrap(v: &mut serde_json::Value, prefix: &str) {
