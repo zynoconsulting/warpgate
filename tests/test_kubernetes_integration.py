@@ -1071,6 +1071,9 @@ class TestKubernetesIntegration:
             target = api.create_target(
                 sdk.TargetDataRequest(
                     name=target_name,
+                    require_approval=False,
+                    ticket_requests_disabled=False,
+                    ticket_require_approval=False,
                     options=sdk.TargetOptions(
                         sdk.TargetOptionsTargetKubernetesOptions(
                             kind="Kubernetes",
