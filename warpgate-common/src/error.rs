@@ -51,6 +51,8 @@ pub enum WarpgateError {
     UserSessionAlreadyAttributed,
     #[error("user session is no longer open")]
     UserSessionEnded,
+    #[error("access to this target was revoked or has expired")]
+    TargetAccessRevoked,
     #[error(transparent)]
     Anyhow(#[from] anyhow::Error),
     #[error(transparent)]
@@ -121,6 +123,7 @@ impl UserFacingReason for WarpgateError {
             | Self::SessionNotApproved
             | Self::UserSessionAlreadyAttributed
             | Self::UserSessionEnded
+            | Self::TargetAccessRevoked
             | Self::NoAdminAccess
             | Self::NoAdminPermission(_)
             | Self::IpAddrNotAllowed(..)
@@ -210,6 +213,7 @@ impl ResponseError for WarpgateError {
             Self::InvalidTicket(_)
             | Self::UserNotFound(_)
             | Self::RoleNotFound(_)
+            | Self::TargetAccessRevoked
             | Self::IpAddrNotAllowed(..) => poem::http::StatusCode::UNAUTHORIZED,
             Self::UserAlreadyExists(_) => poem::http::StatusCode::CONFLICT,
             Self::InvalidRequest(_) => poem::http::StatusCode::BAD_REQUEST,
