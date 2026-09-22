@@ -1102,7 +1102,7 @@ class TestKubernetesIntegration:
             ]
         )
 
-        user_token = create_api_token(url, user.username, "123")
+        user_token = await _issue_user_token(url, user, "ephemeral-certificate")
         server = f"https://127.0.0.1:{shared_wg.kubernetes_port}/{target_name}"
         request = [
             "kubectl",
