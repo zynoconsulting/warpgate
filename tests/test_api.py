@@ -282,6 +282,12 @@ ADMIN_API_TEST_CASES: list[AdminApiTestCase] = [
         expected_statuses={200},
     ),
     AdminApiTestCase(
+        id="get_instance_ca_certificate",
+        permission="config_edit",
+        call=lambda api, r: api.get_instance_ca_certificate_with_http_info(),
+        expected_statuses={200},
+    ),
+    AdminApiTestCase(
         id="import_ssh_own_key",
         permission="config_edit",
         call=lambda api, r: api.import_ssh_own_key_with_http_info(
