@@ -209,7 +209,9 @@ impl SessionStore {
     /// live entry for: the parent row is validated once here. `None` means the
     /// row is gone, ended or not an HTTP session — nothing to re-attach to.
     /// Per-request liveness comes from the cookie-session storage row, which a
-    /// close deletes cluster-wide.
+    /// close deletes cluster-wide. A row with no user yet (a ticket that only
+    /// ever hit a non-proxy route never attributes one) passes regardless of
+    /// the request's own auth, the same as the live-entry check above.
     async fn adopt_handle_for(
         &mut self,
         req: &Request,
@@ -236,7 +238,7 @@ impl SessionStore {
         else {
             return Ok(None);
         };
-        if row.user_id != request_auth_user_id(session) {
+        if row.user_id.is_some() && row.user_id != request_auth_user_id(session) {
             return Err(poem::Error::from_status(
                 poem::http::StatusCode::UNAUTHORIZED,
             ));
