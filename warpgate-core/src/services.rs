@@ -151,13 +151,16 @@ impl Services {
         // here via the cluster notifications endpoint.
         {
             let mut rx = services.cluster.subscribe();
-            let state = services.state.clone();
+            // Grabbed once: this fires on every revoke, and locking the whole
+            // `State` each time to reach its sender would needlessly
+            // contend with everything else that locks it.
+            let nudges = services.state.lock().await.access_watch_sender();
             tokio::spawn(async move {
                 loop {
                     match rx.recv().await {
                         Ok(ClusterNotification::AccessRevoked)
                         | Err(broadcast::error::RecvError::Lagged(_)) => {
-                            state.lock().await.nudge_access_watchers();
+                            nudges.send_modify(|n| *n = n.wrapping_add(1));
                         }
                         Ok(_) => {}
                         Err(broadcast::error::RecvError::Closed) => break,

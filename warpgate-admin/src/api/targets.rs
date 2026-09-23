@@ -317,6 +317,16 @@ impl DetailApi {
             .filter(Ticket::Column::TargetId.eq(target.id))
             .exec(db)
             .await?;
+        // The target's tickets are already gone; nudge every node's access
+        // watchers now so sessions they authorized close right away instead
+        // of on their next poll. Sent here — right after the delete that
+        // makes it true — rather than after the rest of this handler, which
+        // can still fail (and would otherwise leave the notification either
+        // unsent or sent for a target deletion that didn't happen).
+        admin
+            .services()
+            .cluster
+            .notify_global(ClusterNotification::AccessRevoked);
 
         if target.kind == TargetKind::Ssh {
             let options: TargetOptions = serde_json::from_value(target.options.clone())?;
@@ -331,10 +341,6 @@ impl DetailApi {
         }
 
         target.delete(db).await?;
-        // The target's tickets are already gone (deleted above); nudge every
-        // node's access watchers so sessions those tickets authorized close
-        // now instead of on their next poll.
-        admin.services().cluster.notify_global(ClusterNotification::AccessRevoked);
         Ok(DeleteTargetResponse::Deleted)
     }
 
