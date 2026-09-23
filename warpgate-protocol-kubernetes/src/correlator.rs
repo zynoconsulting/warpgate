@@ -349,6 +349,34 @@ impl RequestCorrelator {
         }
     }
 
+    /// Evict the correlated session for a normal (non-ticket-credential)
+    /// identity, unconditionally — unlike [`Self::evict`], with no slot to
+    /// compare against.
+    ///
+    /// Used when a per-request re-check finds that the self-service-ticket
+    /// grant behind an already-admitted session no longer holds (the ticket
+    /// was revoked, expired, or is a different row entirely — see
+    /// `has_active_self_service_ticket`): without this, the session would
+    /// otherwise keep returning 403 to every request until it ages out of the
+    /// correlator on its own (up to `session_max_age`), rather than letting
+    /// the very next request authorize fresh — a role grant, or a new ticket.
+    pub fn evict_stale_ticket_grant(
+        &mut self,
+        user_id: Uuid,
+        target_name: &str,
+        ip: Option<String>,
+    ) {
+        self.handles.remove(&CorrelationKey {
+            user_id,
+            target_name: target_name.to_owned(),
+            ip,
+            // A self-service-ticket *grant* is layered on a normal identity,
+            // never on a ticket-secret credential (see `KubernetesIdentity`),
+            // so the correlation key it was admitted under always has this.
+            ticket_id: None,
+        });
+    }
+
     /// Remove handles older than session_max_age
     pub async fn vacuum(&mut self) {
         let max_age = self

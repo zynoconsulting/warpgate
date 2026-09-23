@@ -412,6 +412,84 @@ def test_ticket_grant_does_not_bypass_credential_policy(shared_wg, ticket_setup)
         _disable_self_service(api)
 
 
+def test_denied_web_approval_does_not_spend_a_ticket_use(shared_wg, ticket_setup):
+    """A request that never gets past the credential policy must not spend a
+    bounded ticket's use: identity/policy is checked before the ticket grant
+    (and its spend), so a rejection has to leave `uses_left` untouched."""
+    api, user, target = ticket_setup
+    api.update_target(target.id, sdk.TargetDataRequest(
+        name=target.name,
+        require_approval=False,
+        ticket_requests_disabled=False,
+        ticket_require_approval=False,
+        ticket_max_uses=1,
+        options=target.options,
+    ))
+    api.create_password_credential(user.id, sdk.NewPasswordCredential(password="123"))
+    api.update_user(
+        user.id,
+        sdk.UserDataRequest(
+            username=user.username,
+            credential_policy=sdk.UserRequireCredentialsPolicy(
+                kubernetes=[sdk.CredentialKind.WEBUSERAPPROVAL],
+            ),
+        ),
+    )
+    _enable_self_service(api)
+
+    url = f"https://localhost:{shared_wg.http_port}"
+    try:
+        with requests.Session() as session:
+            session.verify = False
+            login = session.post(
+                f"{url}/@warpgate/api/auth/login",
+                json={"username": user.username, "password": "123"},
+                timeout=10,
+            )
+            login.raise_for_status()
+            headers = {"Authorization": f"Bearer {_user_api_token(session, url)}"}
+            endpoint = f"https://localhost:{shared_wg.kubernetes_port}/{target.name}/version"
+
+            ticket_id = _activate_self_service_ticket(api, session, url, target)
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(
+                    requests.get, endpoint, headers=headers, verify=False, timeout=15,
+                )
+
+                auth_id = None
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    pending_response = session.get(
+                        f"{url}/@warpgate/api/auth/web-auth-requests", timeout=10,
+                    )
+                    pending_response.raise_for_status()
+                    pending = [
+                        s for s in pending_response.json()
+                        if s["protocol"] == "Kubernetes"
+                    ]
+                    if pending:
+                        auth_id = pending[0]["id"]
+                        break
+                    time.sleep(0.2)
+                assert auth_id is not None
+
+                reject = session.post(
+                    f"{url}/@warpgate/api/auth/state/{auth_id}/reject", timeout=10,
+                )
+                assert reject.status_code == 200
+
+                response = future.result(timeout=15)
+                assert response.status_code in (401, 403), response.text
+
+            remaining = next(
+                t.uses_left for t in api.get_tickets() if str(t.id) == ticket_id
+            )
+            assert remaining == 1
+    finally:
+        _disable_self_service(api)
+
+
 def test_bounded_ticket_spends_one_use_per_correlated_session(shared_wg, ticket_setup):
     """A bounded self-service ticket (``ticket_max_uses=1``) still grants JIT
     access: the correlated session behind one kubectl-style command spends

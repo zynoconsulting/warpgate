@@ -140,17 +140,29 @@ pub async fn handle_api_request(
         correlated_authorization(correlator.0, req, identity, &target_name, ctx.services()).await?;
 
     // A normal identity authorized by a server-side ticket grant can share a
-    // correlated session, but the grant itself must not be cached. Re-check it
-    // before every request so expiry or revocation takes effect immediately.
+    // correlated session, but the grant itself must not be cached. Re-check
+    // the specific granting ticket before every request so its expiry or
+    // revocation takes effect immediately — a used-up or expired *sibling*
+    // self-service ticket for the same user/target must not keep the session
+    // alive on the granting ticket's behalf.
     if !uses_ticket_credential
-        && admitted.ticket_id().is_some()
+        && let Some(ticket_id) = admitted.ticket_id()
         && !has_active_self_service_ticket(
             &ctx.services().db,
+            ticket_id,
             admitted.user_info().id,
             admitted.target().id,
         )
         .await?
     {
+        // The grant is gone: evict the session so the very next request
+        // authorizes fresh (a role, or a new ticket) instead of failing every
+        // request until this entry ages out of the correlator on its own.
+        correlator.0.lock().await.evict_stale_ticket_grant(
+            admitted.user_info().id,
+            &target_name,
+            get_client_ip(req, ctx.services()).await,
+        );
         return Err(poem::Error::from_string(
             format!("Access denied to target: {target_name}"),
             poem::http::StatusCode::FORBIDDEN,

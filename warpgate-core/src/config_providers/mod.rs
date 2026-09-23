@@ -376,10 +376,14 @@ async fn grant_active_self_service_ticket(
 /// Authorize a previously authenticated identity through an activated
 /// self-service ticket for the same user and target.
 ///
-/// This is distinct from ticket-secret authentication: `identity` is proof the
-/// caller's normal identity was already fully authenticated (transport
-/// credential and, where configured, credential policy / MFA); the ticket
-/// supplies only the temporary target grant on top of it.
+/// This is distinct from ticket-secret authentication: this function does not
+/// itself verify that `identity`'s caller was fully authenticated — it takes
+/// that on faith from `AuthorizedIdentity` and only ever supplies the
+/// temporary target grant on top of it. The ordering guarantee comes from its
+/// single caller, `authorize_kubernetes_target` in
+/// `warpgate-protocol-kubernetes`, which runs the full identity check
+/// (transport credential and, where configured, credential policy / MFA)
+/// before constructing the `identity` it passes in here.
 pub async fn authorize_active_self_service_ticket(
     db: &DatabaseConnection,
     identity: AuthorizedIdentity,
@@ -397,17 +401,24 @@ pub async fn authorize_active_self_service_ticket(
 }
 
 /// Re-check a server-side self-service grant so revocation and expiry apply to
-/// every request in a correlated Kubernetes session. Deliberately ignores
-/// `uses_left`: the session's one use was already spent (or was never needed,
-/// for an unlimited ticket) when the grant was made, and re-checking must not
-/// spend again on each of a `kubectl` command's fan-out of requests.
+/// every request in a correlated Kubernetes session. Takes the specific
+/// `ticket_id` the session was granted through — not just any self-service
+/// ticket matching `user_id`/`target_id` — so a used-up (or expired, or
+/// revoked) *sibling* ticket for the same user/target can't paper over the
+/// granting ticket having been revoked. Deliberately ignores `uses_left` on
+/// that specific ticket: the session's one use was already spent (or was
+/// never needed, for an unlimited ticket) when the grant was made, and
+/// re-checking must not spend again on each of a `kubectl` command's fan-out
+/// of requests.
 pub async fn has_active_self_service_ticket(
     db: &DatabaseConnection,
+    ticket_id: Uuid,
     user_id: Uuid,
     target_id: Uuid,
 ) -> Result<bool, WarpgateError> {
     let ticket =
         active_self_service_ticket_base_query(e::Ticket::Entity::find(), user_id, target_id)
+            .filter(e::Ticket::Column::Id.eq(ticket_id))
             .one(db)
             .await?;
     Ok(ticket.is_some())
@@ -940,44 +951,102 @@ mod tests {
         }
     }
 
-    /// The per-request re-check must not consider `uses_left` — the session's
-    /// use was already spent (or never needed) when it was granted — but must
-    /// still respect `self_service` and expiry.
+    /// When both an unlimited and a bounded ticket are eligible, the
+    /// unlimited one is preferred and the bounded one is left completely
+    /// untouched — not even inspected for a race, since it's never a
+    /// candidate once an unlimited ticket exists.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn grant_prefers_unlimited_ticket_and_leaves_bounded_one_untouched() {
+        let (db, _login_protection, target, user_id) = db_fixture(false).await;
+        let (unlimited_id, _) = insert_ticket(&db, user_id, target.id, true, None, None).await;
+        let (bounded_id, _) = insert_ticket(&db, user_id, target.id, true, Some(1), None).await;
+
+        let authorization = grant_for_user(&db, user_id, target)
+            .await
+            .unwrap()
+            .expect("an eligible ticket should grant");
+        assert_eq!(authorization.ticket_id(), Some(unlimited_id));
+
+        assert_eq!(
+            e::Ticket::Entity::find_by_id(bounded_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .uses_left,
+            Some(1),
+        );
+    }
+
+    /// The per-request re-check must not consider `uses_left` on the specific
+    /// ticket it was granted through — the session's use was already spent
+    /// (or never needed) when it was granted — but must still respect that
+    /// ticket's `self_service` and expiry.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn recheck_ignores_uses_left_but_respects_self_service_and_expiry() {
         let (db, _login_protection, target, user_id) = db_fixture(false).await;
-        let (_ticket_id, _) = insert_ticket(&db, user_id, target.id, true, Some(1), None).await;
+        let (ticket_id, _) = insert_ticket(&db, user_id, target.id, true, Some(1), None).await;
 
         // Spend the only use, exactly as the opening request of a correlated
         // session would.
-        assert!(
-            grant_for_user(&db, user_id, target.clone())
-                .await
-                .unwrap()
-                .is_some()
-        );
+        let authorization = grant_for_user(&db, user_id, target.clone())
+            .await
+            .unwrap()
+            .expect("a fresh bounded ticket should grant");
+        assert_eq!(authorization.ticket_id(), Some(ticket_id));
         // Every later request in that same session re-checks the grant; it
         // must still see it as active although uses_left is now 0.
         assert!(
-            has_active_self_service_ticket(&db, user_id, target.id)
+            has_active_self_service_ticket(&db, ticket_id, user_id, target.id)
                 .await
                 .unwrap()
         );
 
         let (db, _login_protection, target, user_id) = db_fixture(false).await;
-        insert_ticket(&db, user_id, target.id, false, None, None).await;
+        let (admin_ticket_id, _) = insert_ticket(&db, user_id, target.id, false, None, None).await;
         assert!(
-            !has_active_self_service_ticket(&db, user_id, target.id)
+            !has_active_self_service_ticket(&db, admin_ticket_id, user_id, target.id)
                 .await
                 .unwrap()
         );
 
         let (db, _login_protection, target, user_id) = db_fixture(false).await;
         let past = OffsetDateTime::now_utc() - time::Duration::seconds(60);
-        insert_ticket(&db, user_id, target.id, true, None, Some(past)).await;
+        let (expired_ticket_id, _) =
+            insert_ticket(&db, user_id, target.id, true, None, Some(past)).await;
         assert!(
-            !has_active_self_service_ticket(&db, user_id, target.id)
+            !has_active_self_service_ticket(&db, expired_ticket_id, user_id, target.id)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// The re-check must target the *specific* ticket a session was granted
+    /// through, not just any self-service ticket matching the user/target: a
+    /// used-up sibling ticket must not paper over the granting ticket having
+    /// been revoked.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn recheck_targets_the_granting_ticket_not_a_sibling() {
+        let (db, _login_protection, target, user_id) = db_fixture(false).await;
+        let (granting_id, _) = insert_ticket(&db, user_id, target.id, true, Some(1), None).await;
+        let (sibling_id, _) = insert_ticket(&db, user_id, target.id, true, Some(1), None).await;
+
+        // The sibling is used up independently but stays unexpired — exactly
+        // the row that would previously have satisfied a (user, target)-only
+        // re-check regardless of which ticket actually opened the session.
+        e::Ticket::spend_use(&db, sibling_id).await.unwrap();
+
+        // The granting ticket is revoked.
+        e::Ticket::Entity::delete_by_id(granting_id)
+            .exec(&db)
+            .await
+            .unwrap();
+
+        assert!(
+            !has_active_self_service_ticket(&db, granting_id, user_id, target.id)
                 .await
                 .unwrap()
         );
