@@ -244,3 +244,70 @@ class TestHTTPUserAuthTicket:
 
         assert closed
         ws.close()
+
+    def test_password_login_closes_a_websocket_opened_under_a_ticket(
+        self,
+        echo_server_port,
+        shared_wg: WarpgateProcess,
+    ):
+        # A websocket opened under a ticket-backed cookie session must not
+        # survive the same browser then logging in as a full user: merely
+        # dropping the old grant's watcher would leave this stream running,
+        # immune to that ticket's later revocation.
+        url = f"https://localhost:{shared_wg.http_port}"
+        with admin_client(url) as api:
+            user, role = create_password_user(api)
+            echo_target = create_http_target(
+                api, role, echo_server_port, require_approval=False
+            )
+            ticket = api.create_ticket(
+                sdk.CreateTicketRequest(
+                    target_name=echo_target.name, username=user.username
+                )
+            )
+
+        session = requests.Session()
+        session.verify = False
+
+        response = session.get(
+            f"{url}/some/path?warpgate-ticket={ticket.secret}",
+            allow_redirects=False,
+        )
+        assert response.status_code // 100 == 2
+
+        cookies = session.cookies.get_dict()
+        cookie = "; ".join([f"{k}={v}" for k, v in cookies.items()])
+        ws = create_connection(
+            f"wss://localhost:{shared_wg.http_port}/socket?warpgate-target={echo_target.name}",
+            cookie=cookie,
+            sslopt={"cert_reqs": ssl.CERT_NONE},
+        )
+        ws.send("test")
+        assert ws.recv() == "test"
+
+        # Same cookie jar: the same browser session now logs in as a full
+        # user, rather than the ticket being revoked.
+        login = session.post(
+            f"{url}/@warpgate/api/auth/login",
+            json={"username": user.username, "password": "123"},
+        )
+        assert login.status_code // 100 == 2
+
+        ws.settimeout(0.25)
+        deadline = time.monotonic() + 15
+        closed = False
+        while time.monotonic() < deadline:
+            try:
+                if ws.recv() == "":
+                    closed = True
+                    break
+            except WebSocketConnectionClosedException:
+                closed = True
+                break
+            except WebSocketTimeoutException:
+                continue
+
+        assert closed, (
+            "websocket opened under the ticket was not closed by the password login"
+        )
+        ws.close()

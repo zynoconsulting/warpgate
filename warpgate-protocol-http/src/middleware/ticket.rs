@@ -124,25 +124,25 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
                 )
                 .await?
                 {
-                    // A cookie-backed session may already carry a watcher for
-                    // whatever grant it held before (a different ticket, or
-                    // none) — drop it before switching, so that grant being
-                    // revoked later can't close a session that no longer
-                    // depends on it. Skipped for a header-borne ticket: those
-                    // are keyed by ticket id (`ticket_session_key`), so a
-                    // different ticket is a different session, not a reused
-                    // one, and never sees this issue.
+                    // A cookie-backed session may already have a stream
+                    // running (or a watcher registered) under whatever grant
+                    // authorized it before — a different ticket, or none.
+                    // Detaching the node-local session-store entry fires its
+                    // close_sender, ending anything still served through it
+                    // here, and drops this node's handle so the next request
+                    // re-adopts fresh state with no leftover watcher; merely
+                    // dropping the watcher would leave an already-open stream
+                    // immune to the old grant's later revocation. Skipped for
+                    // a header-borne ticket: those are keyed by ticket id
+                    // (`ticket_session_key`), so a different ticket is a
+                    // different session, not a reused one, and never sees
+                    // this issue.
                     if !session_is_temporary
                         && let Ok(session_store) =
                             Data::<&Arc<Mutex<SessionStore>>>::from_request_without_body(&req)
                                 .await
-                        && let Ok(handle) = session_store
-                            .lock()
-                            .await
-                            .handle_for_request(&req, &ctx)
-                            .await
                     {
-                        handle.lock().await.clear_access_watches().await;
+                        session_store.lock().await.remove_session(&session);
                     }
 
                     session.set_auth(SessionAuthorization::Ticket {

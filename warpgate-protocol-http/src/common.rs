@@ -356,10 +356,15 @@ pub async fn authorize_session(
     }
 
     // A ticket-backed cookie session that then logs in as a full user must
-    // not keep a watcher for whatever ticket it started under — that ticket
-    // being revoked later must not close a session that no longer depends
-    // on it.
-    server_handle.lock().await.clear_access_watches().await;
+    // not keep whatever was still running (or being watched) under the
+    // grant it started with — merely dropping the watcher would leave an
+    // already-open stream immune to that ticket's later revocation.
+    // Detaching the node-local session-store entry fires its close_sender,
+    // ending anything still served through it here, and drops this node's
+    // handle so the next request re-adopts fresh state with no leftover
+    // watcher — the same mechanism the UserSessionAlreadyAttributed branch
+    // above already relies on.
+    session_middleware.lock().await.remove_session(session);
 
     session.set_auth(SessionAuthorization::User {
         user_id: user_info.id,
