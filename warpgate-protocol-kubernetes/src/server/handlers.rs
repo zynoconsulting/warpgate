@@ -136,7 +136,7 @@ pub async fn handle_api_request(
         .path()
         .to_owned();
 
-    let (handle, admitted) =
+    let (correlation_key, handle, admitted) =
         correlated_authorization(correlator.0, req, identity, &target_name, ctx.services()).await?;
 
     // A normal identity authorized by a server-side ticket grant can share a
@@ -155,14 +155,18 @@ pub async fn handle_api_request(
         )
         .await?
     {
-        // The grant is gone: evict the session so the very next request
-        // authorizes fresh (a role, or a new ticket) instead of failing every
-        // request until this entry ages out of the correlator on its own.
-        correlator.0.lock().await.evict_stale_ticket_grant(
-            admitted.user_info().id,
-            &target_name,
-            get_client_ip(req, ctx.services()).await,
-        );
+        // The grant is gone: evict this specific session (identified by its
+        // handle, not just the key — a stale sibling request racing on the
+        // same key must not evict a session a third request has since opened
+        // and spent a bounded ticket's use for) so the very next request
+        // authorizes fresh — a role, or a new ticket — instead of failing
+        // every request until this entry ages out of the correlator on its
+        // own.
+        correlator
+            .0
+            .lock()
+            .await
+            .evict_session(&correlation_key, &handle);
         return Err(poem::Error::from_string(
             format!("Access denied to target: {target_name}"),
             poem::http::StatusCode::FORBIDDEN,

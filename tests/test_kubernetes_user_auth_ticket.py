@@ -490,6 +490,50 @@ def test_denied_web_approval_does_not_spend_a_ticket_use(shared_wg, ticket_setup
         _disable_self_service(api)
 
 
+def test_revoked_grant_evicts_the_session_for_an_immediate_retry(shared_wg, ticket_setup):
+    """Revoking the ticket behind an admitted grant must evict the stale
+    correlated session, not just deny the request that noticed: a fresh
+    ticket has to grant on its very next request, without waiting for
+    `session_max_age` to age the stale entry out on its own."""
+    api, user, target = ticket_setup
+    api.create_password_credential(user.id, sdk.NewPasswordCredential(password="123"))
+    _enable_self_service(api)
+
+    url = f"https://localhost:{shared_wg.http_port}"
+    try:
+        with requests.Session() as session:
+            session.verify = False
+            login = session.post(
+                f"{url}/@warpgate/api/auth/login",
+                json={"username": user.username, "password": "123"},
+                timeout=10,
+            )
+            login.raise_for_status()
+            headers = {"Authorization": f"Bearer {_user_api_token(session, url)}"}
+            endpoint = f"https://localhost:{shared_wg.kubernetes_port}/{target.name}/version"
+
+            ticket_a = _activate_self_service_ticket(api, session, url, target)
+            allowed = requests.get(endpoint, headers=headers, verify=False, timeout=10)
+            assert allowed.status_code == 200, allowed.text
+
+            revoked = session.delete(
+                f"{url}/@warpgate/api/my-tickets/{ticket_a}", timeout=10,
+            )
+            assert revoked.status_code == 204
+
+            denied = requests.get(endpoint, headers=headers, verify=False, timeout=10)
+            assert denied.status_code == 403
+
+            # A second self-service ticket for the same user/target. If the
+            # denied request above only failed without evicting the stale
+            # session, this would keep failing until session_max_age passed.
+            _activate_self_service_ticket(api, session, url, target)
+            allowed_again = requests.get(endpoint, headers=headers, verify=False, timeout=10)
+            assert allowed_again.status_code == 200, allowed_again.text
+    finally:
+        _disable_self_service(api)
+
+
 def test_bounded_ticket_spends_one_use_per_correlated_session(shared_wg, ticket_setup):
     """A bounded self-service ticket (``ticket_max_uses=1``) still grants JIT
     access: the correlated session behind one kubectl-style command spends
