@@ -37,6 +37,13 @@ pub async fn ws_handler(
         ));
     };
 
+    if session.cancellation().is_cancelled() {
+        return Err(poem::Error::from_string(
+            "Session not found",
+            StatusCode::NOT_FOUND,
+        ));
+    }
+
     session.cancel_disconnect_timer().await;
 
     let registry = ClientManager::clone(&manager);
