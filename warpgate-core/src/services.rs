@@ -145,6 +145,27 @@ impl Services {
             });
         }
 
+        // Bridge cluster-wide revoke notifications into this node's access
+        // watchers. `notify_global` already delivers to this node locally
+        // (no round trip through HTTP), and a peer relays the same message
+        // here via the cluster notifications endpoint.
+        {
+            let mut rx = services.cluster.subscribe();
+            let state = services.state.clone();
+            tokio::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(ClusterNotification::AccessRevoked)
+                        | Err(broadcast::error::RecvError::Lagged(_)) => {
+                            state.lock().await.nudge_access_watchers();
+                        }
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
+
         // Asynchronously detect user approvals received by other nodes
         // and apply them to our AuthStates
         {

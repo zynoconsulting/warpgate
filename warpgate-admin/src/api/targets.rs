@@ -14,6 +14,7 @@ use warpgate_common::{
     WarpgateError, map_target_secrets,
 };
 use warpgate_common_http::errors::invalid_field;
+use warpgate_core::cluster::ClusterNotification;
 use warpgate_db_entities::Target::TargetKind;
 use warpgate_db_entities::{KnownHost, Role, Target, TargetRoleAssignment, Ticket, TicketRequest};
 
@@ -330,6 +331,10 @@ impl DetailApi {
         }
 
         target.delete(db).await?;
+        // The target's tickets are already gone (deleted above); nudge every
+        // node's access watchers so sessions those tickets authorized close
+        // now instead of on their next poll.
+        admin.services().cluster.notify_global(ClusterNotification::AccessRevoked);
         Ok(DeleteTargetResponse::Deleted)
     }
 

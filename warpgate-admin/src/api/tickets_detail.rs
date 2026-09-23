@@ -4,7 +4,7 @@ use sea_orm::EntityTrait;
 use uuid::Uuid;
 use warpgate_common::{AdminPermission, WarpgateError};
 use warpgate_core::logging::AuditEvent;
-use warpgate_core::ticket_requests::delete_ticket;
+use warpgate_core::ticket_requests::revoke_ticket;
 use warpgate_db_entities::{Target, User};
 
 use super::AdminContext;
@@ -57,7 +57,7 @@ impl Api {
             .emit();
         }
 
-        delete_ticket(db, ticket.id).await?;
+        revoke_ticket(admin.services(), ticket.id).await?;
         Ok(DeleteTicketResponse::Deleted)
     }
 }
