@@ -1,11 +1,13 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use poem::session::Session;
+use poem::session::{Session, SessionStatus};
+use poem::web::cookie::CookieJar;
 use poem::web::{Data, FromRequest};
 use poem::{Endpoint, Middleware, Request};
 use serde::Deserialize;
 use tokio::sync::Mutex;
+use tracing::warn;
 use uuid::Uuid;
 use warpgate_common::Secret;
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
@@ -14,8 +16,9 @@ use warpgate_common_http::{SessionAuthorization, authorization_token};
 use warpgate_core::authorize_and_spend_ticket;
 use warpgate_db_entities::Ticket;
 
-use crate::common::SessionExt;
+use crate::common::{SessionExt, storage_session_id};
 use crate::session::SessionStore;
+use crate::session_storage::SharedSessionStorage;
 
 /// Request-data marker for a header-borne ticket: the request runs on a
 /// detached session that is never stored, so the user session registered for
@@ -94,6 +97,7 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
             req.set_data(TemporaryTicketSession);
         }
         let session = <&Session>::from_request_without_body(&req).await?.clone();
+        let mut rotation = None;
 
         if let Some(ticket) = ticket_value {
             let ticket_secret = Secret::new(ticket);
@@ -160,11 +164,45 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
                         target_id: authorization.target().id,
                         ticket_id: authorization.ticket_id(),
                     });
+
+                    // A cookie session gaining auth must get a fresh id, as a
+                    // password login does: otherwise a session id planted in
+                    // the victim's browser beforehand (session fixation) would
+                    // carry the ticket's access. Only on the first hop, since
+                    // cookies set by a forwarded request never reach the
+                    // client.
+                    if !session_is_temporary
+                        && !warpgate_common_http::is_cluster_peer_request(
+                            &req,
+                            &ctx.services().cluster.cluster_token,
+                        )
+                    {
+                        let jar = <&CookieJar>::from_request_without_body(&req).await?;
+                        let storage =
+                            Data::<&SharedSessionStorage>::from_request_without_body(&req)
+                                .await?;
+                        rotation = Some(((*storage).clone(), storage_session_id(jar)));
+                    }
                 }
             }
         }
 
-        self.inner.call(req).await
+        let response = self.inner.call(req).await?;
+
+        // Rotated only once the request is done: rotation deletes the old
+        // `http_sessions` row and the new one is written back after this
+        // returns, and a user session left without a row for the length of a
+        // proxied request can be ended by the orphan sweep in the meantime.
+        if let Some((storage, stored_id)) = rotation
+            && session.status() != SessionStatus::Purged
+            && let Err(error) = storage.rotate_session_id(stored_id, &session).await
+        {
+            // Fail closed: the planted id must not keep the ticket's access.
+            warn!(%error, "Could not rotate the session id after ticket auth");
+            session.purge();
+        }
+
+        Ok(response)
     }
 }
 
