@@ -360,10 +360,17 @@ fn active_self_service_ticket_base_query(
 /// fails with `InvalidTicket` and falls through to the next candidate rather
 /// than denying access outright when another eligible ticket exists.
 ///
-/// `pub` (rather than the rest of this module's ticket-grant internals) since
-/// it is shared directly by `db_auth`, unlike [`authorize_active_self_service_ticket`]
-/// below, which builds the Kubernetes-shaped [`TargetAuthorization`] on top of it.
-pub async fn grant_active_self_service_ticket(
+/// `pub(crate)` (rather than fully private, like [`active_self_service_ticket_base_query`]
+/// above) since `db_auth`'s own protocol-checked caller spends a use
+/// directly through this, rather than through
+/// [`authorize_active_self_service_ticket`] below, which is shaped for
+/// Kubernetes' `AuthorizedIdentity`-and-`Target`-in, `TargetAuthorization`-out
+/// call convention. Crate-private rather than exported crate-wide: spending a
+/// ticket's use for an arbitrary `user_id` has none of the
+/// already-authenticated-identity discipline the `pub` functions around it
+/// enforce, so it must stay reachable only from callers, like `db_auth`, that
+/// supply that discipline themselves.
+pub(crate) async fn grant_active_self_service_ticket(
     db: &DatabaseConnection,
     user_id: Uuid,
     target_id: Uuid,

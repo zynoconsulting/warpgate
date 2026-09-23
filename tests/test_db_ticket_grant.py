@@ -9,9 +9,11 @@ substitutes for the password, and a role still wins first. Revoking or
 expiring the ticket closes a live connection through the same watcher
 `ticket-<secret>` auth already uses (see test_ticket_session_termination.py).
 
-Mirrors tests/test_kubernetes_user_auth_ticket.py's
-`test_activated_request_grants_normal_identity_access` for the self-service
-request/approve/activate lifecycle and the parameters setup/restore pattern.
+Mirrors the self-service request/approve/activate lifecycle and the
+parameters setup/restore pattern used by
+`test_activated_request_grants_normal_identity_access` on the
+`zyno/kubernetes-ticket-jit` branch's tests/test_kubernetes_user_auth_ticket.py
+(that test and branch are not present in this tree).
 """
 
 import os
@@ -55,7 +57,10 @@ def _enable_self_service(url):
 
 def _disable_self_service(url):
     with admin_client(url) as api:
-        api.update_parameters(default_params(ticket_self_service_enabled=False))
+        api.update_parameters(default_params(
+            ticket_self_service_enabled=False,
+            ticket_request_show_all_targets=False,
+        ))
 
 
 def _login(url, username, password="123"):
@@ -145,6 +150,9 @@ class _Postgres:
     def sleep_query(self):
         return "select pg_sleep(3600)"
 
+    def short_sleep_query(self):
+        return "select pg_sleep(7)"
+
     def probe_query(self):
         return "select 1"
 
@@ -189,6 +197,9 @@ class _Mysql:
 
     def sleep_query(self):
         return "select sleep(3600)"
+
+    def short_sleep_query(self):
+        return "select sleep(7)"
 
     def probe_query(self):
         return "select 1"
@@ -292,7 +303,10 @@ def _revoke_closes_a_live_connection(processes, timeout, wg, driver):
         with admin_client(url) as api:
             api.delete_ticket(ticket_id)
 
-        assert client.wait(timeout=30) is not None, "session was not closed"
+        # `wait` raises on timeout rather than returning, so reaching the
+        # next line at all is "closed"; the interesting assertion is that it
+        # closed as a failure, not a completed 3600-second sleep.
+        client.wait(timeout=30)
         assert client.returncode != 0
     finally:
         _disable_self_service(url)
@@ -326,7 +340,10 @@ def _role_wins_and_survives_revoke(processes, timeout, wg, driver):
     url = f"https://localhost:{wg.http_port}"
     with admin_client(url) as api:
         user, role = create_password_user(api)
-        target = driver.create_target(api)
+        # Bounded to one use, so a role grant leaving it untouched is a
+        # direct, non-vacuous check rather than relying on an unlimited
+        # ticket where "not spent" can't be observed.
+        target = driver.create_target(api, ticket_max_uses=1)
         api.add_target_role(target.id, role.id)
     username = f"{user.username}#{target.name}"
 
@@ -339,6 +356,9 @@ def _role_wins_and_survives_revoke(processes, timeout, wg, driver):
         assert client.poll() is None, "the role-granted connection failed to open"
 
         with admin_client(url) as api:
+            assert _ticket_uses_left(api, ticket_id) == 1, (
+                "a role grant must not spend the also-active ticket's use"
+            )
             sessions = api.get_sessions(username=user.username).items
         recorded = [ts for s in sessions for ts in s.target_sessions]
         assert recorded and all(ts.ticket_id is None for ts in recorded), (
@@ -368,20 +388,24 @@ def _bounded_ticket_spends_one_use_and_survives_exhaustion(processes, timeout, w
     try:
         _, ticket_id = _activate_self_service_ticket(url, user.username, target.name)
 
-        first = _start(processes, driver, wg, username, "123", driver.sleep_query())
+        # Short enough to run to completion within the test, long enough
+        # that the second connection's denial below overlaps it.
+        first = _start(processes, driver, wg, username, "123", driver.short_sleep_query())
         with admin_client(url) as api:
             assert _poll(lambda: _ticket_uses_left(api, ticket_id) == 0), (
                 "the first connection never spent the ticket's only use"
             )
         assert first.poll() is None, "the first connection ended unexpectedly"
 
-        # No uses left and no role: a second connection is denied.
+        # No uses left and no role: a second connection is denied while the
+        # first is still running its query.
         assert _run(processes, driver, wg, username, "123", driver.probe_query(), timeout) != 0
 
-        # The first connection is unaffected by the second's denial.
-        assert first.poll() is None, "an exhausted ticket must not close a session it already admitted"
-        first.kill()
-        first.wait(timeout=timeout)
+        # The first connection ran its query to completion rather than being
+        # cut short by the second connection's denial.
+        assert first.wait(timeout=30) == 0, (
+            "an exhausted ticket must not close a session it already admitted"
+        )
     finally:
         _disable_self_service(url)
 
