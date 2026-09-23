@@ -352,25 +352,12 @@ fn active_self_service_ticket_base_query(
 /// requests, but only the correlated session's opening request reaches this
 /// path (see [`has_active_self_service_ticket`] for the per-request re-check,
 /// which must not spend again), so a bounded ticket is only ever charged once
-/// per session — the same cost as ticket-secret authentication. The same is
-/// true of a MySQL/PostgreSQL connection: one grant per connection, spent
-/// here once by `warpgate_core::db_auth`'s own caller.
+/// per session — the same cost as ticket-secret authentication.
 ///
 /// Two sessions can race for a bounded ticket's last use; the loser's spend
 /// fails with `InvalidTicket` and falls through to the next candidate rather
 /// than denying access outright when another eligible ticket exists.
-///
-/// `pub(crate)` (rather than fully private, like [`active_self_service_ticket_base_query`]
-/// above) since `db_auth`'s own protocol-checked caller spends a use
-/// directly through this, rather than through
-/// [`authorize_active_self_service_ticket`] below, which is shaped for
-/// Kubernetes' `AuthorizedIdentity`-and-`Target`-in, `TargetAuthorization`-out
-/// call convention. Crate-private rather than exported crate-wide: spending a
-/// ticket's use for an arbitrary `user_id` has none of the
-/// already-authenticated-identity discipline the `pub` functions around it
-/// enforce, so it must stay reachable only from callers, like `db_auth`, that
-/// supply that discipline themselves.
-pub(crate) async fn grant_active_self_service_ticket(
+async fn grant_active_self_service_ticket(
     db: &DatabaseConnection,
     user_id: Uuid,
     target_id: Uuid,
