@@ -169,6 +169,7 @@ class TestHTTPUserAuthTicket:
             secret = api.create_ticket(sdk.CreateTicketRequest(
                 target_name=target.name,
                 username=user.username,
+                number_of_uses=1,
             )).secret
 
         # An attacker obtains an unauthenticated session cookie...
@@ -188,6 +189,11 @@ class TestHTTPUserAuthTicket:
         response = victim.get(f"{url}/some/path?warpgate-ticket={secret}", allow_redirects=False)
         assert response.status_code // 100 == 2
         assert response.cookies.get("warpgate-http-session") not in (None, planted)
+
+        # The rotated session was persisted: the single-use ticket's access
+        # carries on without presenting it again.
+        response = victim.get(f"{url}/some/path", allow_redirects=False)
+        assert response.status_code // 100 == 2
 
         # The planted id must not carry the ticket's access.
         response = attacker.get(
