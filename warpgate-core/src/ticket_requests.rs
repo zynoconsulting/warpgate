@@ -450,7 +450,11 @@ pub async fn list_ticket_requests(
     Ok(query.all(db_conn).await?)
 }
 
-pub async fn delete_ticket(
+/// Deletes a ticket's row (and any request that activated it). Does not by
+/// itself end sessions the ticket already authorized — callers must go
+/// through [`revoke_ticket`] instead, which is why this is not `pub`: making
+/// it `pub(crate)` forces every revoke onto the nudging path at compile time.
+pub(crate) async fn delete_ticket(
     db: &sea_orm::DatabaseConnection,
     ticket_id: Uuid,
 ) -> Result<(), WarpgateError> {
@@ -464,5 +468,20 @@ pub async fn delete_ticket(
     Ticket::Entity::delete_by_id(ticket_id).exec(&txn).await?;
     txn.commit().await?;
 
+    Ok(())
+}
+
+/// Deletes a ticket and ends every session it authorized, on every node in
+/// the cluster: `delete_ticket` alone would leave an already-admitted
+/// session running until its access watcher's next poll (up to its interval,
+/// a few seconds, later) instead of closing it right away.
+pub async fn revoke_ticket(
+    services: &crate::Services,
+    ticket_id: Uuid,
+) -> Result<(), WarpgateError> {
+    delete_ticket(&services.db, ticket_id).await?;
+    services
+        .cluster
+        .notify_global(crate::cluster::ClusterNotification::AccessRevoked);
     Ok(())
 }

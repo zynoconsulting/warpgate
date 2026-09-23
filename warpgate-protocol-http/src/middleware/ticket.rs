@@ -1,9 +1,11 @@
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use poem::session::Session;
 use poem::web::{Data, FromRequest};
 use poem::{Endpoint, Middleware, Request};
 use serde::Deserialize;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 use warpgate_common::Secret;
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
@@ -13,6 +15,7 @@ use warpgate_core::authorize_and_spend_ticket;
 use warpgate_db_entities::Ticket;
 
 use crate::common::SessionExt;
+use crate::session::SessionStore;
 
 /// Request-data marker for a header-borne ticket: the request runs on a
 /// detached session that is never stored, so the user session registered for
@@ -121,6 +124,36 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
                 )
                 .await?
                 {
+                    // A cookie-backed session may already have a stream
+                    // running (or a watcher registered) under whatever grant
+                    // authorized it before — a different ticket, or none.
+                    // Detaching the node-local session-store entry fires its
+                    // close_sender, ending anything still served through it
+                    // here, and drops this node's handle so the next request
+                    // re-adopts fresh state with no leftover watcher; merely
+                    // dropping the watcher would leave an already-open stream
+                    // immune to the old grant's later revocation. Skipped for
+                    // a header-borne ticket: those are keyed by ticket id
+                    // (`ticket_session_key`), so a different ticket is a
+                    // different session, not a reused one, and never sees
+                    // this issue.
+                    //
+                    // Also skipped when the session had no authorization at
+                    // all yet — a half-finished login (a row already
+                    // registered, e.g. by a login attempt in progress, but
+                    // never attributed) has nothing running under a stale
+                    // grant to protect against, so detaching would only cost
+                    // a needless round trip through the store (the re-adopt
+                    // below accepts an unattributed row regardless).
+                    if !session_is_temporary
+                        && session.get_auth().is_some()
+                        && let Ok(session_store) =
+                            Data::<&Arc<Mutex<SessionStore>>>::from_request_without_body(&req)
+                                .await
+                    {
+                        session_store.lock().await.remove_session(&session);
+                    }
+
                     session.set_auth(SessionAuthorization::Ticket {
                         user_id: authorization.user_info().id,
                         username: authorization.user_info().username.clone(),

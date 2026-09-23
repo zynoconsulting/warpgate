@@ -79,3 +79,74 @@ class Test:
                 return api.get_session(session_id).ended is not None
 
         assert _poll(ended), "session never marked ended after close"
+
+    def test_cross_node_ticket_revocation(
+        self,
+        processes: ProcessManager,
+        timeout,
+        wg_c_ed25519_pubkey,
+    ):
+        # A ticket session admitted on node A; its access watcher lives only
+        # there. Revoking the ticket from node B must reach it through the
+        # cluster notification the revoke sends, not a local nudge.
+        #
+        # Node A's own poll interval is set far longer than the test: with
+        # the default 5s interval, a delete landing just before A's next
+        # scheduled poll would close the session almost immediately even if
+        # the cross-node notification were entirely broken, which is what
+        # makes a short assertion window alone unable to prove delivery. At
+        # 300s, only the notification can close it in time.
+        node_a = processes.start_wg(
+            env={"WARPGATE_ACCESS_WATCH_INTERVAL_SECS": "300"}
+        )
+        wait_port(node_a.http_port, recv=False)
+        node_b = processes.start_wg(share_with=node_a)
+        wait_port(node_b.http_port, recv=False)
+
+        url_a = f"https://localhost:{node_a.http_port}"
+        url_b = f"https://localhost:{node_b.http_port}"
+
+        user, ssh_target = setup_user_and_target(processes, node_a, wg_c_ed25519_pubkey)
+        with admin_client(url_a) as api:
+            ticket = api.create_ticket(
+                sdk.CreateTicketRequest(
+                    target_name=ssh_target.name, username=user.username
+                )
+            )
+
+        marker = f"cluster-ticket-{uuid4().hex}"
+        ssh_client = processes.start_ssh_client(
+            f"ticket-{ticket.secret}@localhost",
+            "-p",
+            str(node_a.ssh_port),
+            "-tt",
+            *common_args,
+            f"echo {marker}; sleep 3600",
+            password="123",
+        )
+        output = read_until(
+            ssh_client.stdout, marker.encode(), time.monotonic() + timeout
+        )
+        assert marker.encode() in output, "marker never appeared in session output"
+
+        session_id = _poll(lambda: _live_ssh_session_id(url_b, user.username))
+        assert session_id is not None, "live session not visible from node B"
+
+        # Revoke FROM NODE B: node A never receives this call directly, only
+        # the cluster-wide notification it triggers.
+        with admin_client(url_b) as api:
+            api.delete_ticket(ticket.ticket.id)
+
+        # Node A's own poll is 300s away; without the cluster notification
+        # actually reaching it, nothing on node A would close this session
+        # within this window. A pass here is what proves the notification
+        # (not eventual local polling) did the work.
+        assert ssh_client.wait(timeout=10) is not None, (
+            "session was not closed via the cross-node ticket-revocation notification"
+        )
+
+        def ended():
+            with admin_client(url_b) as api:
+                return api.get_session(session_id).ended is not None
+
+        assert _poll(ended), "session never marked ended after ticket revocation"

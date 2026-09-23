@@ -1248,8 +1248,10 @@ impl ServerSession {
     pub async fn handle_session_control(&mut self, command: SessionHandleCommand) -> Result<()> {
         match command {
             SessionHandleCommand::Close => {
-                let _ = self.emit_service_message("Session closed by admin");
-                info!("Session closed by admin");
+                // Not just an admin action any more (a revoked/expired ticket
+                // closes the same way), so this stays neutral about the cause.
+                let _ = self.emit_service_message("Session closed");
+                info!("Session closed");
                 self.request_disconnect();
                 self.disconnect_server().await;
             }
@@ -2504,10 +2506,20 @@ impl ServerSession {
                             authorization.target().name
                         );
                         let user_info = authorization.user_info().clone();
-                        self._auth_accept(user_info.clone(), Some(authorization))
-                            .await?;
-
-                        Ok(AuthResult::Accepted { user_info })
+                        // The ticket could be revoked or expire in the gap
+                        // between validating it above and admission here; that
+                        // is an ordinary auth rejection, not a session error.
+                        match self
+                            ._auth_accept(user_info.clone(), Some(authorization))
+                            .await
+                        {
+                            Ok(()) => Ok(AuthResult::Accepted { user_info }),
+                            Err(WarpgateError::TargetAccessRevoked) => {
+                                warn!("Ticket was revoked or expired before the session could start");
+                                Ok(AuthResult::Rejected)
+                            }
+                            Err(error) => Err(error.into()),
+                        }
                     }
                     None => Ok(AuthResult::Rejected),
                 }

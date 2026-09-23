@@ -355,6 +355,24 @@ pub async fn authorize_session(
             .await?;
     }
 
+    // A ticket-backed cookie session that then logs in as a full user must
+    // not keep whatever was still running (or being watched) under the
+    // grant it started with — merely dropping the watcher would leave an
+    // already-open stream immune to that ticket's later revocation.
+    // Detaching the node-local session-store entry fires its close_sender,
+    // ending anything still served through it here, and drops this node's
+    // handle so the next request re-adopts fresh state with no leftover
+    // watcher — the same mechanism the UserSessionAlreadyAttributed branch
+    // above already relies on.
+    //
+    // Only when the previous authorization was actually a ticket, though:
+    // a same-user step-up re-auth (web_auth_max_age_seconds) or an SSO
+    // re-login has no stale grant to protect against, and detaching there
+    // would needlessly kill this browser's already-open websockets/streams.
+    if matches!(session.get_auth(), Some(SessionAuthorization::Ticket { .. })) {
+        session_middleware.lock().await.remove_session(session);
+    }
+
     session.set_auth(SessionAuthorization::User {
         user_id: user_info.id,
         username: user_info.username,

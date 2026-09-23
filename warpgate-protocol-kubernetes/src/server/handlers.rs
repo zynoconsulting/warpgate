@@ -10,6 +10,7 @@ use reqwest_websocket::Upgrade;
 use serde::Deserialize;
 use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::tungstenite;
+use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, warn};
 use url::Url;
 use warpgate_common::helpers::websocket::pump_websocket;
@@ -21,13 +22,13 @@ use warpgate_common_http::logging::{
 };
 use warpgate_core::logging::KubernetesAuditSubject;
 use warpgate_core::recordings::{TerminalRecorder, TerminalRecordingStreamId};
-use warpgate_core::{Services, has_active_self_service_ticket};
+use warpgate_core::{Services, WarpgateServerHandle, has_active_self_service_ticket};
 
 use crate::audit::{StreamOperation, classify_mutating, classify_stream};
 use crate::correlator::{AdmittedSession, RequestCorrelator, correlated_authorization};
 use crate::recording::{start_recording_api, start_recording_exec};
 use crate::server::auth::{
-    KubernetesIdentity, authenticate_kubernetes_user, create_authenticated_client,
+    KubernetesIdentity, authenticate_kubernetes_user, create_authenticated_client, unauthorized,
 };
 
 /// A client-supplied impersonation header (`Impersonate-User`,
@@ -136,8 +137,13 @@ pub async fn handle_api_request(
         .path()
         .to_owned();
 
-    let (correlation_key, handle, admitted) =
+    let (correlation_key, handle, admitted, closed) =
         correlated_authorization(correlator.0, req, identity, &target_name, ctx.services()).await?;
+    // The correlated session could have been closed (admin close, or its
+    // ticket revoked) between being looked up and reaching here.
+    if closed.is_cancelled() {
+        return Err(unauthorized());
+    }
 
     // A normal identity authorized by a server-side ticket grant can share a
     // correlated session, but the grant itself must not be cached. Re-check
@@ -207,6 +213,8 @@ pub async fn handle_api_request(
                 &api_path,
                 &audit_subject,
                 ctx.services(),
+                closed.clone(),
+                handle.clone(),
             )
             .await
             .map(IntoResponse::into_response)
@@ -222,6 +230,8 @@ pub async fn handle_api_request(
                 &api_path,
                 &audit_subject,
                 ctx.services(),
+                closed,
+                handle.clone(),
             )
             .await
             .map(IntoResponse::into_response)
@@ -268,6 +278,8 @@ async fn _handle_normal_request_inner(
     api_path: &str,
     audit_subject: &KubernetesAuditSubject,
     services: &Services,
+    closed: CancellationToken,
+    handle: Arc<Mutex<WarpgateServerHandle>>,
 ) -> Result<Response, WarpgateError> {
     let user_info = admitted.user_info();
     let k8s_options = admitted.options();
@@ -396,7 +408,15 @@ async fn _handle_normal_request_inner(
         "Sending request to upstream Kubernetes API"
     );
 
-    let response = request_builder.send().await?;
+    // A correlated session can be admitted once and reused for a long time
+    // (up to `session_max_age`); racing every request against `closed` is
+    // what makes a mid-session revoke or admin close take effect immediately
+    // rather than only on the session's next re-admission.
+    let response = tokio::select! {
+        biased;
+        () = closed.cancelled() => return Err(WarpgateError::TargetAccessRevoked),
+        result = request_builder.send() => result?,
+    };
 
     let status = response.status();
     let response_headers = response.headers().clone();
@@ -439,15 +459,45 @@ async fn _handle_normal_request_inner(
             .any(|(k, v)| (k == "watch" || k == "follow") && v == "true");
 
         if transfer_encoding == "chunked" || is_streaming_response {
-            (
-                Body::from_bytes_stream(response.bytes_stream().map_err(std::io::Error::other)),
-                None,
-            )
+            // A `kubectl logs -f`/`watch=true` stream can run for as long as
+            // the ticket that opened it, well past `session_max_age` ageing
+            // the correlator's own entry out of its cache. Carrying `handle`
+            // in the stream's state (rather than just racing `closed`) keeps
+            // the session — and its access watcher — alive for as long as
+            // this stream is actually read, so a still-open `logs -f` can't
+            // outlive the thing revoking it just because the cache forgot it.
+            let upstream = response.bytes_stream().map_err(std::io::Error::other);
+            let stream = futures::stream::unfold(
+                (upstream, closed.clone(), handle.clone(), false),
+                |(mut upstream, closed, handle, done)| async move {
+                    if done {
+                        return None;
+                    }
+                    tokio::select! {
+                        biased;
+                        // A clean EOF would read to `kubectl` as the stream
+                        // having ended normally (exit 0); an error instead
+                        // surfaces the close as the abrupt cutoff it is.
+                        () = closed.cancelled() => Some((
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionAborted,
+                                "session closed",
+                            )),
+                            (upstream, closed, handle, true),
+                        )),
+                        item = upstream.next() => {
+                            item.map(|item| (item, (upstream, closed, handle, false)))
+                        }
+                    }
+                },
+            );
+            (Body::from_bytes_stream(stream), None)
         } else {
-            let bytes = response
-                .bytes()
-                .await
-                .context("reading kubernetes response")?;
+            let bytes = tokio::select! {
+                biased;
+                () = closed.cancelled() => return Err(WarpgateError::TargetAccessRevoked),
+                result = response.bytes() => result.context("reading kubernetes response")?,
+            };
 
             (Body::from_bytes(bytes.clone()), Some(bytes.to_vec()))
         }
@@ -535,6 +585,8 @@ async fn _handle_websocket_request_inner(
     api_path: &str,
     audit_subject: &KubernetesAuditSubject,
     services: &Services,
+    closed: CancellationToken,
+    handle: Arc<Mutex<WarpgateServerHandle>>,
 ) -> anyhow::Result<impl IntoResponse> {
     let user_info = admitted.user_info();
     let k8s_options = admitted.options();
@@ -588,13 +640,22 @@ async fn _handle_websocket_request_inner(
     let audit_subject = audit_subject.clone();
 
     let ws_handler_inner = async move |socket: WebSocketStream| {
-        let client_response = client
-            .get(full_url.clone())
-            .upgrade()
-            .protocols(vec![ws_protocol])
-            .send()
-            .await
-            .context("sending websocket request to Kubernetes API")?;
+        // Held for the life of the pump below, not just the request that
+        // upgraded it: `session_max_age` can age this session's entry out of
+        // the correlator's cache while the socket is still open, and without
+        // a strong reference here that would drop the last
+        // `WarpgateServerHandle`, tearing the session (and its access
+        // watcher) down out from under a websocket that is still in use.
+        let _session_handle = handle;
+        let client_response = tokio::select! {
+            biased;
+            () = closed.cancelled() => bail!("Session closed while upgrading the Kubernetes websocket"),
+            result = client
+                .get(full_url.clone())
+                .upgrade()
+                .protocols(vec![ws_protocol])
+                .send() => result.context("sending websocket request to Kubernetes API")?,
+        };
 
         let status = client_response.status();
         let established = status == http::StatusCode::SWITCHING_PROTOCOLS;
@@ -650,8 +711,13 @@ async fn _handle_websocket_request_inner(
         });
 
         // Whichever direction ends first takes the stream down; the other is
-        // dropped rather than left to fail writing into the closed socket.
+        // dropped rather than left to fail writing into the closed socket. A
+        // session close (admin close, or its ticket revoked) takes the
+        // stream down the same way — otherwise a long-lived `exec`/`attach`/
+        // `port-forward` would outlive the access that opened it.
         let result = tokio::select! {
+            biased;
+            () = closed.cancelled() => Ok(()),
             result = server_to_client => result,
             result = client_to_server => result,
         };

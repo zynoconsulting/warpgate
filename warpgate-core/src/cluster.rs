@@ -39,6 +39,13 @@ pub enum ClusterNotification {
         session_id: UserSessionId,
         user_id: Uuid,
     },
+    /// A ticket was deleted (revoked) or a target was deleted, taking its
+    /// tickets with it. Bridged into a local
+    /// [`crate::State::nudge_access_watchers`] call on every node, so a
+    /// session admitted under it closes promptly instead of waiting out its
+    /// watcher's poll interval. Carries no payload: watchers each re-check
+    /// their own grant, so there is nothing this message needs to name.
+    AccessRevoked,
 }
 
 pub struct RemoteNode {
@@ -644,6 +651,11 @@ mod tests {
         assert_eq!(plain, r#"{"type":"sessions_changed"}"#);
         let back: ClusterNotification = serde_json::from_str(&plain).unwrap();
         assert!(matches!(back, ClusterNotification::SessionsChanged));
+
+        let revoked = serde_json::to_string(&ClusterNotification::AccessRevoked).unwrap();
+        assert_eq!(revoked, r#"{"type":"access_revoked"}"#);
+        let back: ClusterNotification = serde_json::from_str(&revoked).unwrap();
+        assert!(matches!(back, ClusterNotification::AccessRevoked));
     }
 
     #[tokio::test]

@@ -14,6 +14,7 @@ use warpgate_common::{
     WarpgateError, map_target_secrets,
 };
 use warpgate_common_http::errors::invalid_field;
+use warpgate_core::cluster::ClusterNotification;
 use warpgate_db_entities::Target::TargetKind;
 use warpgate_db_entities::{KnownHost, Role, Target, TargetRoleAssignment, Ticket, TicketRequest};
 
@@ -329,6 +330,16 @@ impl DetailApi {
             .filter(Ticket::Column::TargetId.eq(target.id))
             .exec(db)
             .await?;
+        // The target's tickets are already gone; nudge every node's access
+        // watchers now so sessions they authorized close right away instead
+        // of on their next poll. Sent here — right after the delete that
+        // makes it true — rather than after the rest of this handler, which
+        // can still fail (and would otherwise leave the notification either
+        // unsent or sent for a target deletion that didn't happen).
+        admin
+            .services()
+            .cluster
+            .notify_global(ClusterNotification::AccessRevoked);
 
         if target.kind == TargetKind::Ssh {
             let options: TargetOptions = serde_json::from_value(target.options.clone())?;

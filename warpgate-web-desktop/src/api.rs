@@ -24,10 +24,11 @@ pub async fn ws_handler(
     ws: WebSocket,
 ) -> poem::Result<impl IntoResponse> {
     // Someone else's session reads as absent: a stream request must not
-    // reveal that the id exists.
+    // reveal that the id exists. A closed session reads the same way — it
+    // must not be reattachable once torn down (e.g. by a revoked ticket).
     let session = match manager.access(session_id, ctx.auth.user_id()).await {
-        SessionAccess::Granted(session) => session,
-        SessionAccess::NotFound | SessionAccess::Forbidden => {
+        SessionAccess::Granted(session) if !session.is_dead() => session,
+        SessionAccess::Granted(_) | SessionAccess::NotFound | SessionAccess::Forbidden => {
             return Err(poem::Error::from_string(
                 "Session not found",
                 StatusCode::NOT_FOUND,
