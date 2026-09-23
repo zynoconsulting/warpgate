@@ -1290,7 +1290,7 @@ async fn a_rejection_gives_the_use_back() {
 /// Delivering recorded self-approval decisions to the auth state they were
 /// asked for. Needs a real `Services` because delivery spans the store and the
 /// rows; everything heavy in it just wraps the same in-memory database.
-mod delivery {
+pub(crate) mod delivery {
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -1325,7 +1325,7 @@ mod delivery {
         }
     }
 
-    pub(super) async fn test_services(db: &DatabaseConnection) -> Services {
+    pub(crate) async fn test_services(db: &DatabaseConnection) -> Services {
         let params = GlobalParams::new(PathBuf::from("/warpgate.yaml"), false).unwrap();
         let rate_limiter_registry = Arc::new(Mutex::new(RateLimiterRegistry::new(db.clone())));
         let cluster = Arc::new(Cluster::new(db.clone(), 0).await.unwrap());

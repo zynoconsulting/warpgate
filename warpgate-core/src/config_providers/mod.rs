@@ -352,12 +352,18 @@ fn active_self_service_ticket_base_query(
 /// requests, but only the correlated session's opening request reaches this
 /// path (see [`has_active_self_service_ticket`] for the per-request re-check,
 /// which must not spend again), so a bounded ticket is only ever charged once
-/// per session — the same cost as ticket-secret authentication.
+/// per session — the same cost as ticket-secret authentication. The same is
+/// true of a MySQL/PostgreSQL connection: one grant per connection, spent
+/// here once by `warpgate_core::db_auth`'s own caller.
 ///
 /// Two sessions can race for a bounded ticket's last use; the loser's spend
 /// fails with `InvalidTicket` and falls through to the next candidate rather
 /// than denying access outright when another eligible ticket exists.
-async fn grant_active_self_service_ticket(
+///
+/// `pub` (rather than the rest of this module's ticket-grant internals) since
+/// it is shared directly by `db_auth`, unlike [`authorize_active_self_service_ticket`]
+/// below, which builds the Kubernetes-shaped [`TargetAuthorization`] on top of it.
+pub async fn grant_active_self_service_ticket(
     db: &DatabaseConnection,
     user_id: Uuid,
     target_id: Uuid,
