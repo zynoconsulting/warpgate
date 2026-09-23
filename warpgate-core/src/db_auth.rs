@@ -384,11 +384,15 @@ async fn authorize_user<T: DbAuthTransport>(
 }
 
 /// Authorizes an already-fully-authenticated `identity` for `target_name`: a
-/// role first, or — when no role grants it, and the target actually speaks
-/// `identity`'s own protocol — an activated self-service ticket for that same
-/// user and target. A missing target, a role-less user with no eligible
-/// ticket, and a target of some other protocol are all the same `None` here,
-/// so the caller's denial can't distinguish them from each other.
+/// role first (regardless of the target's own protocol -- same as the
+/// pre-JIT behaviour this replaces, and still narrowed against `identity`'s
+/// protocol by the caller's own [`ApprovedTarget::narrow`] afterwards), or
+/// -- only when no role grants it -- an activated self-service ticket for
+/// that same user and target, gated on the target actually speaking
+/// `identity`'s protocol. A missing target, a role-less user with no
+/// eligible ticket, and a role-less user whose target is of some other
+/// protocol are all the same `None` here, so the caller's denial can't
+/// distinguish them from each other.
 ///
 /// The ticket supplies only the target grant on top of `identity`: it is
 /// never itself a substitute for the credential policy that produced

@@ -89,10 +89,12 @@ pub(crate) fn default_timing() -> (Duration, Duration) {
     }
 }
 
-/// What a target session's admission was granted under. Only a ticket today;
-/// the `zyno/database-ticket-jit` branch adds a `SelfService` variant for
-/// role-based access minted just-in-time, which is why this is kept as an
-/// enum rather than a bare ticket id.
+/// What a target session's admission was granted under. Only a ticket today
+/// -- the DB protocols' self-service JIT grant is watched through this same
+/// `Ticket` variant rather than one of its own, since from here on it *is*
+/// just a ticket a role happened not to be needed to reach. Kept as an enum
+/// rather than a bare ticket id so a future non-ticket grant kind has
+/// somewhere to go without changing every caller.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum AccessGrant {
     Ticket {
