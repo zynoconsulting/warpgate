@@ -585,3 +585,85 @@ def test_admin_close_session_ends_a_web_approval_wait(shared_wg, ticket_setup):
             assert response.status_code == 401
     finally:
         session.close()
+
+
+@pytest.mark.asyncio
+async def test_ticket_revocation_closes_open_websocket(shared_wg, ticket_setup):
+    """A ticket admits a correlated session once and it is then reused for a
+    long time (`session_max_age`); revoking the ticket has to reach a
+    websocket that is already open under it, not just refuse the next new
+    one."""
+    import aiohttp
+
+    runner, port = await _run_echo_and_watch_upstream()
+    try:
+        api, user, _ = ticket_setup
+        setup = api, user, create_target(api, port)
+        ticket = create_ticket(setup, number_of_uses=1)
+        async with aiohttp.ClientSession(headers={
+            "Authorization": f"Bearer ticket-{ticket.secret}",
+        }) as session:
+            url = f"https://localhost:{shared_wg.kubernetes_port}"
+            async with session.ws_connect(
+                f"{url}/socket", ssl=False, protocols=["v4.channel.k8s.io"],
+            ) as ws:
+                await ws.send_str("still alive")
+                assert (await ws.receive(timeout=5)).data == "still alive"
+
+                api.delete_ticket(ticket.ticket.id)
+
+                closed = await ws.receive(timeout=15)
+                assert closed.type in (
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.CLOSING,
+                    aiohttp.WSMsgType.ERROR,
+                ), closed
+    finally:
+        await runner.cleanup()
+
+
+
+@pytest.mark.asyncio
+async def test_ticket_revocation_ends_watch_stream(shared_wg, ticket_setup):
+    """A `?watch=true` chunked stream (`kubectl get --watch`) opened once
+    under a ticket must EOF when that ticket is revoked, even though it was
+    admitted long before the revoke."""
+    import aiohttp
+
+    runner, port = await _run_echo_and_watch_upstream()
+    try:
+        api, user, _ = ticket_setup
+        setup = api, user, create_target(api, port)
+        ticket = create_ticket(setup, number_of_uses=1)
+        async with aiohttp.ClientSession(headers={
+            "Authorization": f"Bearer ticket-{ticket.secret}",
+        }) as session:
+            url = f"https://localhost:{shared_wg.kubernetes_port}"
+            async with session.get(
+                f"{url}/api/v1/pods?watch=true", ssl=False
+            ) as response:
+                assert response.status == 200
+                # At least one chunk, so the stream is genuinely open before
+                # we revoke it.
+                chunk = await asyncio.wait_for(
+                    response.content.readline(), timeout=5
+                )
+                assert b"ADDED" in chunk
+
+                api.delete_ticket(ticket.ticket.id)
+
+                # EOFs (readline returns b"") instead of streaming forever.
+                async def drain():
+                    try:
+                        while True:
+                            data = await response.content.readline()
+                            if not data:
+                                return
+                    except aiohttp.ClientPayloadError:
+                        return
+
+                await asyncio.wait_for(drain(), timeout=15)
+    finally:
+        await runner.cleanup()
+
