@@ -182,14 +182,14 @@ impl TargetAuthorization {
     pub fn for_ticket_session(
         user_info: AuthStateUserInfo,
         target: Target,
-        ticket_id: Option<Uuid>,
+        ticket_id: Uuid,
         protocol: Protocol,
     ) -> Result<Self, WarpgateError> {
         Ok(Self {
             user_info,
             target: SpecificTarget::any(target),
             protocol,
-            ticket_id,
+            ticket_id: Some(ticket_id),
         })
     }
 
@@ -233,6 +233,18 @@ impl<O> TargetAuthorization<O> {
     /// The ticket this authorization came from, if any.
     pub const fn ticket_id(&self) -> Option<Uuid> {
         self.ticket_id
+    }
+
+    /// The liveness grant backing this authorization, if any. `None` for a
+    /// role-based authorization: nothing revokes those mid-session today, so
+    /// there is nothing for [`crate::access_watch`] to watch.
+    pub fn access_grant(&self) -> Option<crate::access_watch::AccessGrant> {
+        self.ticket_id
+            .map(|ticket_id| crate::access_watch::AccessGrant::Ticket {
+                ticket_id,
+                user_id: self.user_info.id,
+                target_id: self.target.id,
+            })
     }
 }
 

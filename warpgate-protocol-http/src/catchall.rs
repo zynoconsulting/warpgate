@@ -74,7 +74,7 @@ pub async fn catchall_endpoint(
         .start_target_session(authorization)
         .await;
     let admitted = match started {
-        Err(WarpgateError::UserSessionEnded) => {
+        Err(WarpgateError::UserSessionEnded | WarpgateError::TargetAccessRevoked) => {
             // got revoked in the meantime
             session.purge();
             return Err(poem::Error::from_status(
@@ -143,6 +143,18 @@ async fn get_target_for_request(
         ..
     }) = &ctx.auth
     {
+        // A cookie session stored from a pre-0.29 ticket login carries no
+        // ticket id, so its access can never be re-checked against the
+        // ticket table. It could once outlive a revoked or expired ticket
+        // forever; it no longer gets to.
+        let Some(ticket_id) = *ticket_id else {
+            let session = <&Session>::from_request_without_body(req).await?;
+            session.purge();
+            return Err(poem::Error::from_status(
+                poem::http::StatusCode::UNAUTHORIZED,
+            ));
+        };
+
         let Some(target) = config_provider.get_target_by_id(*target_id).await? else {
             return Ok(None);
         };
@@ -161,7 +173,7 @@ async fn get_target_for_request(
                     username: username.clone(),
                 },
                 target,
-                *ticket_id,
+                ticket_id,
                 crate::common::PROTOCOL_NAME,
             )?,
         ));

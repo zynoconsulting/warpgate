@@ -1811,7 +1811,7 @@ mod polled_gate {
                 crate::TargetAuthorization::for_ticket_session(
                     someone(),
                     target,
-                    Some(ticket_id),
+                    ticket_id,
                     Protocol::Http,
                 )
                 .unwrap(),
@@ -1846,7 +1846,7 @@ mod polled_gate {
             crate::TargetAuthorization::for_ticket_session(
                 user_info.clone(),
                 gated_target("prod"),
-                Some(ticket_id),
+                ticket_id,
                 Protocol::Http,
             )
             .unwrap()

@@ -99,7 +99,7 @@ pub async fn bind_server(
                             Err(error) => error!(%error, "Session failed"),
                         }),
                         _ = abort_rx.recv() => span.in_scope(|| {
-                            warn!("Session aborted by admin");
+                            warn!("Session aborted");
                         }),
                     }
                     Ok(())

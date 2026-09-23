@@ -122,7 +122,7 @@ impl ProtocolServer for PostgresProtocolServer {
                                 Err(e) => error!(error=%e, "Session failed"),
                             },
                             _ = abort_rx.recv() => {
-                                warn!("Session aborted by admin");
+                                warn!("Session aborted");
                             },
                         }
 

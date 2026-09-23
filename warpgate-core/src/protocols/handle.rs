@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
 use sea_orm::{ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter};
+use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span};
 use uuid::Uuid;
 use warpgate_common::auth::AuthStateUserInfo;
@@ -12,6 +14,7 @@ use warpgate_common::{
 use warpgate_db_entities::TargetSession::TargetSessionOpenOutcome;
 use warpgate_db_entities::{TargetSession, UserSession};
 
+use crate::access_watch::{AccessGrant, AccessWatchSettings, Liveness};
 use crate::rate_limiting::{RateLimiterRegistry, stack_rate_limiters};
 use crate::{ApprovedTarget, State, TargetAuthorization, UserSessionState};
 
@@ -34,11 +37,14 @@ pub struct WarpgateServerHandle {
     node_owned: bool,
     node_id: NodeId,
     provisional: bool,
+    /// Access-watch polling config for this handle, and the nudge receiver
+    /// to clone from when (re)watching a grant — see [`crate::access_watch`].
+    access_watch: AccessWatchSettings,
 }
 
 impl WarpgateServerHandle {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         user_session_id: UserSessionId,
         db: DatabaseConnection,
         state: Arc<Mutex<State>>,
@@ -47,6 +53,7 @@ impl WarpgateServerHandle {
         protocol: Protocol,
         node_owned: bool,
         node_id: NodeId,
+        access_watch: AccessWatchSettings,
     ) -> Self {
         Self {
             user_session_id,
@@ -58,6 +65,7 @@ impl WarpgateServerHandle {
             node_owned,
             node_id,
             provisional: false,
+            access_watch,
         }
     }
 
@@ -189,6 +197,26 @@ impl WarpgateServerHandle {
         &self,
         authorization: &TargetAuthorization<O>,
     ) -> Result<TargetSessionId, WarpgateError> {
+        // The grant backing this admission comes from the authorization, not
+        // from whatever `open_or_lookup` returns below: a dedup hit can be an
+        // existing row opened under a different (or since-cleared) ticket,
+        // and `target_sessions.ticket_id` is `ON DELETE SET NULL` — neither
+        // is safe to re-derive a liveness check from.
+        let mut watch_after_open = None;
+        if let Some(grant) = authorization.access_grant() {
+            // Cloned and caught up *before* the check, so a revoke landing
+            // between the check and the watcher spawning below is still seen
+            // by that watcher rather than missed as "already observed".
+            let mut nudges = self.access_watch.nudges.clone();
+            nudges.borrow_and_update();
+            match grant.check(&self.db, OffsetDateTime::now_utc()).await? {
+                Liveness::Revoked | Liveness::Expired => {
+                    return Err(WarpgateError::TargetAccessRevoked);
+                }
+                Liveness::Live { until } => watch_after_open = Some((grant, nudges, until)),
+            }
+        }
+
         let outcome = TargetSession::open_or_lookup(
             &self.db,
             TargetSessionId(Uuid::new_v4()),
@@ -208,7 +236,52 @@ impl WarpgateServerHandle {
             }
             TargetSessionOpenOutcome::AlreadyExists(model) => model,
         };
+
+        if let Some((grant, nudges, until)) = watch_after_open {
+            self.ensure_access_watch(grant, nudges, until).await;
+        }
+
         Ok(target_session.id)
+    }
+
+    /// Starts watching `grant` for revocation/expiry if this node-local
+    /// session isn't already watching it — a repeat admission under the same
+    /// grant (another HTTP request, another `kubectl` call) must not spawn a
+    /// second watcher.
+    async fn ensure_access_watch(
+        &self,
+        grant: AccessGrant,
+        nudges: tokio::sync::watch::Receiver<u64>,
+        deadline: Option<OffsetDateTime>,
+    ) {
+        let (token, weak_handle, username) = {
+            let mut state = self.user_session_state.lock().await;
+            if state.access_watches.contains_key(&grant) {
+                return;
+            }
+            let token = CancellationToken::new();
+            state
+                .access_watches
+                .insert(grant.clone(), token.clone().drop_guard());
+            let weak_handle = state.handle.downgrade();
+            let username = state
+                .user_info
+                .as_ref()
+                .map_or_else(String::new, |info| info.username.clone());
+            (token, weak_handle, username)
+        };
+
+        let id = self.user_session_id;
+        let span = info_span!("Access", session = %id, session_username = %username);
+        let settings = AccessWatchSettings {
+            interval: self.access_watch.interval,
+            unconfirmed_limit: self.access_watch.unconfirmed_limit,
+            nudges,
+        };
+        tokio::spawn(
+            crate::access_watch::watch(self.db.clone(), grant, weak_handle, token, settings, deadline)
+                .instrument(span),
+        );
     }
 
     async fn needs_target_approval(&self, target: &Target) -> Result<bool, WarpgateError> {
