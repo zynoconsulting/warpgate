@@ -151,7 +151,7 @@ class _Postgres:
         return "select pg_sleep(3600)"
 
     def short_sleep_query(self):
-        return "select pg_sleep(7)"
+        return "select pg_sleep(30)"
 
     def probe_query(self):
         return "select 1"
@@ -199,7 +199,7 @@ class _Mysql:
         return "select sleep(3600)"
 
     def short_sleep_query(self):
-        return "select sleep(7)"
+        return "select sleep(30)"
 
     def probe_query(self):
         return "select 1"
@@ -388,8 +388,9 @@ def _bounded_ticket_spends_one_use_and_survives_exhaustion(processes, timeout, w
     try:
         _, ticket_id = _activate_self_service_ticket(url, user.username, target.name)
 
-        # Short enough to run to completion within the test, long enough
-        # that the second connection's denial below overlaps it.
+        # Short enough to run to completion within the test, long enough to
+        # outlast the uses_left poll and the second connection's denial below
+        # (and several access-watch polls) with margin.
         first = _start(processes, driver, wg, username, "123", driver.short_sleep_query())
         with admin_client(url) as api:
             assert _poll(lambda: _ticket_uses_left(api, ticket_id) == 0), (
@@ -403,7 +404,7 @@ def _bounded_ticket_spends_one_use_and_survives_exhaustion(processes, timeout, w
 
         # The first connection ran its query to completion rather than being
         # cut short by the second connection's denial.
-        assert first.wait(timeout=30) == 0, (
+        assert first.wait(timeout=60) == 0, (
             "an exhausted ticket must not close a session it already admitted"
         )
     finally:
