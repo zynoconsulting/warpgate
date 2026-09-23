@@ -1,5 +1,6 @@
 """Kubernetes tickets route without a target selector or additional credentials."""
 
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import json
@@ -261,5 +262,158 @@ async def test_ticket_websocket_uses_same_session(shared_wg, ticket_setup):
                 await ws.send_str("ticket websocket")
                 assert (await ws.receive(timeout=5)).data == "ticket websocket"
         assert uses_left(setup, ticket) == 0
+    finally:
+        await runner.cleanup()
+
+
+async def _run_echo_and_watch_upstream():
+    """An upstream mock that echoes over a websocket and, for `watch=true`,
+    streams chunks forever. Returns (runner, port); caller must `.cleanup()`
+    the runner.
+    """
+    import aiohttp
+    from aiohttp import web
+
+    async def upstream(req):
+        assert req.headers["Authorization"] == "Bearer upstream-token"
+        if req.query.get("watch") == "true":
+            resp = web.StreamResponse(headers={"Transfer-Encoding": "chunked"})
+            await resp.prepare(req)
+            try:
+                while True:
+                    await resp.write(b'{"type":"ADDED"}\n')
+                    await asyncio.sleep(0.5)
+            except (ConnectionResetError, asyncio.CancelledError):
+                pass
+            return resp
+        if req.path == "/api":
+            return web.json_response({})
+        ws = web.WebSocketResponse(protocols=["v4.channel.k8s.io"])
+        await ws.prepare(req)
+        async for message in ws:
+            await ws.send_str(message.data)
+        return ws
+
+    app = web.Application()
+    app.router.add_get("/{path:.*}", upstream)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = alloc_port()
+    await web.TCPSite(runner, "127.0.0.1", port).start()
+    return runner, port
+
+
+@pytest.mark.asyncio
+async def test_ticket_revocation_closes_open_websocket(shared_wg, ticket_setup):
+    """A ticket admits a correlated session once and it is then reused for a
+    long time (`session_max_age`); revoking the ticket has to reach a
+    websocket that is already open under it, not just refuse the next new
+    one."""
+    import aiohttp
+
+    runner, port = await _run_echo_and_watch_upstream()
+    try:
+        api, user, _ = ticket_setup
+        setup = api, user, create_target(api, port)
+        ticket = create_ticket(setup, number_of_uses=1)
+        async with aiohttp.ClientSession(headers={
+            "Authorization": f"Bearer ticket-{ticket.secret}",
+        }) as session:
+            url = f"https://localhost:{shared_wg.kubernetes_port}"
+            async with session.ws_connect(
+                f"{url}/socket", ssl=False, protocols=["v4.channel.k8s.io"],
+            ) as ws:
+                await ws.send_str("still alive")
+                assert (await ws.receive(timeout=5)).data == "still alive"
+
+                api.delete_ticket(ticket.ticket.id)
+
+                closed = await ws.receive(timeout=15)
+                assert closed.type in (
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.CLOSING,
+                    aiohttp.WSMsgType.ERROR,
+                ), closed
+    finally:
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_ticket_revocation_ends_watch_stream(shared_wg, ticket_setup):
+    """A `?watch=true` chunked stream (`kubectl get --watch`) opened once
+    under a ticket must EOF when that ticket is revoked, even though it was
+    admitted long before the revoke."""
+    import aiohttp
+
+    runner, port = await _run_echo_and_watch_upstream()
+    try:
+        api, user, _ = ticket_setup
+        setup = api, user, create_target(api, port)
+        ticket = create_ticket(setup, number_of_uses=1)
+        async with aiohttp.ClientSession(headers={
+            "Authorization": f"Bearer ticket-{ticket.secret}",
+        }) as session:
+            url = f"https://localhost:{shared_wg.kubernetes_port}"
+            async with session.get(
+                f"{url}/api/v1/pods?watch=true", ssl=False
+            ) as response:
+                assert response.status == 200
+                # At least one chunk, so the stream is genuinely open before
+                # we revoke it.
+                chunk = await asyncio.wait_for(
+                    response.content.readline(), timeout=5
+                )
+                assert b"ADDED" in chunk
+
+                api.delete_ticket(ticket.ticket.id)
+
+                # EOFs (readline returns b"") instead of streaming forever.
+                async def drain():
+                    while True:
+                        data = await response.content.readline()
+                        if not data:
+                            return
+
+                await asyncio.wait_for(drain(), timeout=15)
+    finally:
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_admin_close_session_ends_websocket(shared_wg, ticket_setup):
+    """Admin-initiated close reaches an open Kubernetes websocket too --
+    `KubernetesSessionHandle::close()` used to be a no-op, so this never
+    worked before."""
+    import aiohttp
+
+    runner, port = await _run_echo_and_watch_upstream()
+    try:
+        api, user, _ = ticket_setup
+        setup = api, user, create_target(api, port)
+        ticket = create_ticket(setup, number_of_uses=1)
+        async with aiohttp.ClientSession(headers={
+            "Authorization": f"Bearer ticket-{ticket.secret}",
+        }) as session:
+            url = f"https://localhost:{shared_wg.kubernetes_port}"
+            async with session.ws_connect(
+                f"{url}/socket", ssl=False, protocols=["v4.channel.k8s.io"],
+            ) as ws:
+                await ws.send_str("still alive")
+                assert (await ws.receive(timeout=5)).data == "still alive"
+
+                session_id = next(
+                    s.id for s in api.get_sessions(username=user.username).items
+                    if s.protocol == "Kubernetes" and s.ended is None
+                )
+                api.close_session(session_id)
+
+                closed = await ws.receive(timeout=15)
+                assert closed.type in (
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.CLOSING,
+                    aiohttp.WSMsgType.ERROR,
+                ), closed
     finally:
         await runner.cleanup()

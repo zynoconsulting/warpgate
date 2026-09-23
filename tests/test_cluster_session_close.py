@@ -79,3 +79,59 @@ class Test:
                 return api.get_session(session_id).ended is not None
 
         assert _poll(ended), "session never marked ended after close"
+
+    def test_cross_node_ticket_revocation(
+        self,
+        processes: ProcessManager,
+        timeout,
+        wg_c_ed25519_pubkey,
+    ):
+        # A ticket session admitted on node A; its access watcher lives only
+        # there. Revoking the ticket from node B must reach it through the
+        # cluster notification the revoke sends, not a local nudge.
+        node_a = processes.start_wg()
+        wait_port(node_a.http_port, recv=False)
+        node_b = processes.start_wg(share_with=node_a)
+        wait_port(node_b.http_port, recv=False)
+
+        url_a = f"https://localhost:{node_a.http_port}"
+        url_b = f"https://localhost:{node_b.http_port}"
+
+        user, ssh_target = setup_user_and_target(processes, node_a, wg_c_ed25519_pubkey)
+        with admin_client(url_a) as api:
+            ticket = api.create_ticket(
+                sdk.CreateTicketRequest(
+                    target_name=ssh_target.name, username=user.username
+                )
+            )
+
+        marker = f"cluster-ticket-{uuid4().hex}"
+        ssh_client = processes.start_ssh_client(
+            f"ticket-{ticket.secret}@localhost",
+            "-p",
+            str(node_a.ssh_port),
+            "-tt",
+            *common_args,
+            f"echo {marker}; sleep 3600",
+            password="123",
+        )
+        output = read_until(
+            ssh_client.stdout, marker.encode(), time.monotonic() + timeout
+        )
+        assert marker.encode() in output, "marker never appeared in session output"
+
+        session_id = _poll(lambda: _live_ssh_session_id(url_b, user.username))
+        assert session_id is not None, "live session not visible from node B"
+
+        # Revoke FROM NODE B: node A never receives this call directly, only
+        # the cluster-wide notification it triggers.
+        with admin_client(url_b) as api:
+            api.delete_ticket(ticket.ticket.id)
+
+        assert ssh_client.wait(timeout=30) is not None, "session was not closed"
+
+        def ended():
+            with admin_client(url_b) as api:
+                return api.get_session(session_id).ended is not None
+
+        assert _poll(ended), "session never marked ended after ticket revocation"
