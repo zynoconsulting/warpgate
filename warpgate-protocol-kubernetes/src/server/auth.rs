@@ -180,6 +180,20 @@ pub async fn authenticate_kubernetes_user(
 /// `session_id` is that of the session the caller has registered for this
 /// request: the auth state is keyed by it, which is what lets a web approval
 /// raised on another node be routed back to the waiting request.
+///
+/// Order matters, and is enforced entirely by this being the single caller of
+/// both `authorize_for_target` and `authorize_active_self_service_ticket`
+/// below: the identity must be fully authenticated — transport credential,
+/// and the user's Kubernetes credential policy / MFA on top of it — *before*
+/// either grant is considered. A self-service ticket supplies only a
+/// temporary target grant; it must never let a request skip the identity
+/// checks a normal login would have to pass. Role is also checked before the
+/// ticket so `ticket_id` is only set when the ticket was actually needed —
+/// otherwise a role holder would get a spurious 403 mid-session if their
+/// (typically auto-approved) ticket later expired or was revoked. The target
+/// lookup itself is deferred until after the identity check too, so an
+/// authenticated-but-not-yet-approved caller can't use a 404/403 split to
+/// probe which target names exist without completing web approval first.
 pub async fn authorize_kubernetes_target(
     req: &Request,
     user: &User,
@@ -187,37 +201,35 @@ pub async fn authorize_kubernetes_target(
     session_id: UserSessionId,
     services: &Services,
 ) -> poem::Result<TargetAuthorization<TargetKubernetesOptions>> {
-    let target = lookup_kubernetes_target(services.config_provider.as_ref(), target_name).await?;
-
-    // Activation is the explicit approval step. The client continues to prove
-    // its normal identity; the active ticket supplies temporary target access.
-    if let Some(authorization) = authorize_active_self_service_ticket(
-        &services.db,
-        user.into(),
-        target.clone(),
-        crate::PROTOCOL_NAME,
-    )
-    .await?
-    {
-        return authorization.narrow().map_err(Into::into);
-    }
-
     let client_ip = get_client_ip_addr(req, services).await;
 
     // When the user has a Kubernetes credential policy, enforce its web-approval
     // factor on top of the transport identity; otherwise use the identity directly.
     let identity =
         authorize_kubernetes_identity(services, user, client_ip, target_name, session_id).await?;
-    authorize_for_target(services.config_provider.as_ref(), &identity, target)
-        .await?
-        .ok_or_else(|| {
-            poem::Error::from_string(
-                format!("Access denied to target: {target_name}"),
-                poem::http::StatusCode::FORBIDDEN,
-            )
-        })?
-        .narrow()
-        .map_err(Into::into)
+
+    let target = lookup_kubernetes_target(services.config_provider.as_ref(), target_name).await?;
+
+    if let Some(authorization) =
+        authorize_for_target(services.config_provider.as_ref(), &identity, target.clone()).await?
+    {
+        return authorization.narrow().map_err(Into::into);
+    }
+
+    // No role grants this target. Fall back to an activated self-service
+    // ticket: activation is the explicit approval step, and by this point
+    // `identity` was only ever constructed by the full identity check above,
+    // so the ticket only ever supplies the target grant on top of it.
+    if let Some(authorization) =
+        authorize_active_self_service_ticket(&services.db, identity, target).await?
+    {
+        return authorization.narrow().map_err(Into::into);
+    }
+
+    Err(poem::Error::from_string(
+        format!("Access denied to target: {target_name}"),
+        poem::http::StatusCode::FORBIDDEN,
+    ))
 }
 
 /// Turn a validated Kubernetes identity into an [`AuthorizedIdentity`], applying

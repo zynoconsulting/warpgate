@@ -21,7 +21,7 @@ use crate::server::auth::{
 use crate::session_handle::KubernetesSessionHandle;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct CorrelationKey {
+pub(crate) struct CorrelationKey {
     user_id: Uuid,
     target_name: String,
     ip: Option<String>,
@@ -124,6 +124,12 @@ pub struct RequestCorrelator {
 /// approval. The session is registered up front for the same reason: a cluster
 /// peer can then resolve this node as the session's owner (via `user_sessions`
 /// table) and route a pending approval back here.
+///
+/// Returns the [`CorrelationKey`] the session was correlated under alongside
+/// the handle and admission, so a caller that later needs to evict this
+/// specific session (see [`RequestCorrelator::evict_session`]) doesn't have to
+/// rebuild the key itself — which would otherwise mean re-deriving fields such
+/// as `ticket_id` outside the one place that knows how to compute them.
 pub async fn correlated_authorization(
     correlator: &Arc<Mutex<RequestCorrelator>>,
     request: &Request,
@@ -131,6 +137,7 @@ pub async fn correlated_authorization(
     target_name: &str,
     services: &Services,
 ) -> poem::Result<(
+    CorrelationKey,
     Arc<Mutex<WarpgateServerHandle>>,
     AdmittedSession,
     CancellationToken,
@@ -156,10 +163,10 @@ pub async fn correlated_authorization(
         // after a denial.
         let existing = correlator.lock().await.entry(&key, max_age);
         if let Some((handle, slot, closed)) = existing
-            && let Some(joined) =
+            && let Some((handle, admitted, closed)) =
                 join_session(correlator, &key, handle, slot, closed, services).await?
         {
-            return Ok(joined);
+            return Ok((key.clone(), handle, admitted, closed));
         }
 
         // Registered outside the correlator lock so that concurrent first
@@ -241,7 +248,7 @@ pub async fn correlated_authorization(
                     }
                 };
                 *authorization = Authorization::Authorized(admitted.clone());
-                Ok((handle, admitted, closed))
+                Ok((key.clone(), handle, admitted, closed))
             }
             Err(error) => {
                 // A denied attempt is not cached: the requests waiting on this
@@ -423,6 +430,36 @@ impl RequestCorrelator {
             .handles
             .get(key)
             .is_some_and(|entry| Arc::ptr_eq(&entry.authorization, slot))
+        {
+            self.handles.remove(key);
+        }
+    }
+
+    /// Evict the correlated session for `key`, but — like [`Self::evict`],
+    /// and unlike a plain `self.handles.remove(key)` — only if it is still
+    /// the specific session `handle` refers to, never a different session
+    /// (e.g. one just opened by another request) that has since taken this
+    /// key's place.
+    ///
+    /// Used when a per-request re-check finds that the self-service-ticket
+    /// grant behind an already-admitted session no longer holds (the ticket
+    /// was revoked, expired, or is a different row entirely — see
+    /// `has_active_self_service_ticket`): without eviction, the session would
+    /// otherwise keep returning 403 to every request until it ages out of the
+    /// correlator on its own (up to `session_max_age`), rather than letting
+    /// the very next request authorize fresh — a role grant, or a new ticket.
+    /// But without the `handle` check, a *second* stale request racing on the
+    /// same key could instead evict a session a third request had already
+    /// opened and paid a bounded ticket's use for in the meantime.
+    pub fn evict_session(
+        &mut self,
+        key: &CorrelationKey,
+        handle: &Arc<Mutex<WarpgateServerHandle>>,
+    ) {
+        if self
+            .handles
+            .get(key)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.handle, handle))
         {
             self.handles.remove(key);
         }
