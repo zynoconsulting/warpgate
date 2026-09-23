@@ -128,7 +128,14 @@ class Test:
         with admin_client(url_b) as api:
             api.delete_ticket(ticket.ticket.id)
 
-        assert ssh_client.wait(timeout=30) is not None, "session was not closed"
+        # A tight deadline, well under the watcher's own (5s) poll interval:
+        # without the cluster notification actually reaching node A, this
+        # would only close on node A's own next periodic poll, which this
+        # window is too short to wait out — so a pass here is what proves the
+        # notification (not just eventual local polling) did the work.
+        assert ssh_client.wait(timeout=3) is not None, (
+            "session was not closed via the cross-node ticket-revocation notification"
+        )
 
         def ended():
             with admin_client(url_b) as api:

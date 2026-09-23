@@ -177,7 +177,7 @@ class TestSsh:
             )
             api.add_target_role(ssh_target.id, role.id)
 
-            expiry = (datetime.now(timezone.utc) + timedelta(seconds=10)).isoformat()
+            expiry = (datetime.now(timezone.utc) + timedelta(seconds=20)).isoformat()
             ticket = api.create_ticket(
                 sdk.CreateTicketRequest(
                     target_name=ssh_target.name,
@@ -201,13 +201,14 @@ class TestSsh:
         )
         assert marker.encode() in output, "marker never appeared in session output"
 
-        # Still well within the ticket's 10s life.
-        time.sleep(3)
+        # Still well within the ticket's 20s life.
+        time.sleep(8)
         assert ssh_client.poll() is None, "session ended before its ticket expired"
 
-        # The watcher closes it at the deadline itself, not on some later
-        # coarse poll -- so this should land well before the default 5s poll
-        # interval would even matter.
+        # Closes once the ticket's own expiry passes. (The precise
+        # deadline-vs-poll-interval timing is covered tightly by the Rust
+        # unit test `expiry_closes_at_deadline_not_poll`; this just proves
+        # the whole pipeline does it for a real SSH session.)
         assert ssh_client.wait(timeout=30) is not None, (
             "session was not closed at its ticket's expiry"
         )

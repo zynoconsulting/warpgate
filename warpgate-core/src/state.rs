@@ -61,6 +61,14 @@ impl State {
         self.access_watch_nudges.send_modify(|n| *n = n.wrapping_add(1));
     }
 
+    /// The sender behind [`Self::nudge_access_watchers`], for a caller (the
+    /// cluster-notification bridge task) that fires it often and would
+    /// otherwise have to lock the whole `State` just to reach it. Grab this
+    /// once at startup rather than re-locking `State` on every notification.
+    pub fn access_watch_sender(&self) -> Arc<watch::Sender<u64>> {
+        self.access_watch_nudges.clone()
+    }
+
     /// Speeds up access-watch polling for a test, so it does not have to wait
     /// out the production interval.
     #[cfg(test)]
@@ -1292,7 +1300,10 @@ mod tests {
         let (db, state) =
             state_with_watch_timing(Duration::from_secs(3600), Duration::from_secs(3600)).await;
         let access_target = target();
-        let expiry = OffsetDateTime::now_utc() + time::Duration::milliseconds(300);
+        // Long enough that admitting the session (a handful of DB round
+        // trips) can't itself eat into the margin before the deadline on a
+        // slow/loaded CI box.
+        let expiry = OffsetDateTime::now_utc() + time::Duration::seconds(2);
         let (user_info, ticket_id) = insert_ticket(&db, &access_target, Some(expiry), None).await;
 
         let closes = Arc::new(AtomicUsize::new(0));
@@ -1322,7 +1333,7 @@ mod tests {
             .unwrap()
             .started();
 
-        for _ in 0..100 {
+        for _ in 0..250 {
             if closes.load(Ordering::SeqCst) > 0 {
                 return;
             }
@@ -1503,19 +1514,31 @@ mod tests {
             .unwrap()
             .started();
 
+        // Kept alive independently of `parent`/`UserSessionState`: without
+        // this, `CountingHandle` itself drops the moment they do, and a
+        // watcher that leaked (bug not actually fixed) would call `close()`
+        // on an already-gone `Weak` and silently no-op — this test would
+        // then pass whether or not cancellation actually worked. Holding a
+        // `SharedSessionHandle` clone here doesn't hold `UserSessionState`
+        // itself alive (a separate Arc), so teardown below is unaffected.
+        let _keep_handle_alive = parent
+            .lock()
+            .await
+            .user_session_state()
+            .lock()
+            .await
+            .handle
+            .clone();
+
         drop(parent);
 
-        // Teardown runs on a spawned task; poll until the row is ended and
-        // the node-local state has been dropped from the map (its only other
-        // owner) — i.e. until nothing should be watching any more.
+        // Teardown runs on a spawned task; poll until the node-local state
+        // has been dropped from the map (its only other owner) — i.e. until
+        // nothing should be watching any more. (Not also waiting on the DB
+        // row's `ended` timestamp: that's covered elsewhere and only slows
+        // this test down.)
         for _ in 0..50 {
-            let ended = UserSession::Entity::find_by_id(parent_id)
-                .one(&db)
-                .await
-                .unwrap()
-                .map(|row| row.ended.is_some())
-                .unwrap_or(false);
-            if ended && !state.lock().await.user_sessions.contains_key(&parent_id) {
+            if !state.lock().await.user_sessions.contains_key(&parent_id) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
