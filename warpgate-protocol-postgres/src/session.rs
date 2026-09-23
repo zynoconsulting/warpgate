@@ -17,7 +17,7 @@ use tracing::{debug, error, info, info_span, warn};
 use url::Url;
 use warpgate_common::auth::AuthSelector;
 use warpgate_common::{
-    PostgresProtocolVersion, Protocol, Secret, TargetPostgresOptions, UserSessionId,
+    PostgresProtocolVersion, Protocol, Secret, TargetPostgresOptions, UserSessionId, WarpgateError,
 };
 use warpgate_common_http::ext::construct_external_url;
 use warpgate_core::{
@@ -327,12 +327,22 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin> PostgresSession<S> {
             }
         };
 
-        let admitted = self
+        let admission = self
             .server_handle
             .lock()
             .await
             .register_approved_target_session(approved)
-            .await?;
+            .await;
+        let admitted = match admission {
+            Ok(admitted) => admitted,
+            Err(WarpgateError::TargetAccessRevoked) => {
+                warn!("Ticket was revoked or expired before the session could start");
+                self.send_error_response("28000".into(), "Warpgate access denied".into())
+                    .await?;
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
 
         self.run_authorized_inner(startup, admitted).await
     }

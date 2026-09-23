@@ -11,7 +11,7 @@ use tracing::{error, info, info_span, trace, warn};
 use url::Url;
 use warpgate_common::auth::AuthSelector;
 use warpgate_common::helpers::rng::get_crypto_rng;
-use warpgate_common::{Protocol, Secret, TargetMySqlOptions, UserSessionId};
+use warpgate_common::{Protocol, Secret, TargetMySqlOptions, UserSessionId, WarpgateError};
 use warpgate_common_http::ext::construct_external_url;
 use warpgate_core::{
     AdmittedTarget, ApprovedTarget, AuthOkPermit, DbAuthTransport, Services, WarpgateServerHandle,
@@ -267,12 +267,29 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin> MySqlSession<S> {
             return Ok(());
         };
 
-        let admitted = self
+        let admission = self
             .server_handle
             .lock()
             .await
             .register_approved_target_session(approved)
-            .await?;
+            .await;
+        let admitted = match admission {
+            Ok(admitted) => admitted,
+            Err(WarpgateError::TargetAccessRevoked) => {
+                warn!("Ticket was revoked or expired before the session could start");
+                self.stream.push(
+                    &ErrPacket {
+                        error_code: 1,
+                        error_message: "Warpgate access denied".to_owned(),
+                        sql_state: None,
+                    },
+                    (),
+                )?;
+                self.stream.flush().await?;
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
 
         self.run_authorized_inner(handshake, admitted).await
     }
