@@ -503,3 +503,36 @@ class TestMysqlTicketGrant:
 
     def test_ticket_secret_login_still_works(self, processes, timeout, shared_wg: WarpgateProcess):
         _ticket_secret_login_still_works(processes, timeout, shared_wg, self._driver(processes, shared_wg))
+
+
+def test_unauthorized_target_does_not_count_as_a_failed_login(
+    processes: ProcessManager, timeout, shared_postgres_port
+):
+    # A dedicated instance: the lockout thresholds below would otherwise leak
+    # into every other test on the shared one.
+    wg = processes.start_wg()
+    wait_port(wg.http_port, for_process=wg.process, recv=False)
+    url = f"https://localhost:{wg.http_port}"
+    with admin_client(url) as api:
+        api.update_parameters(default_params(
+            login_protection_enabled=True,
+            lp_ip_max_attempts=3,
+            lp_ip_time_window_seconds=600,
+            lp_user_max_attempts=3,
+            lp_user_time_window_seconds=600,
+        ))
+        user, _role = create_password_user(api)
+    driver = _Postgres(shared_postgres_port)
+    driver.wait_ready(wg)
+    with admin_client(url) as api:
+        target = driver.create_target(api)
+    username = f"{user.username}#{target.name}"
+
+    # A client retrying with correct credentials but no role or ticket (e.g.
+    # after its ticket lapsed) is denied every time...
+    for _ in range(5):
+        assert _run(processes, driver, wg, username, "123", driver.probe_query(), timeout) != 0
+
+    # ...but is neither IP-blocked nor locked out, so the user can still log
+    # in to the web UI to request a new ticket.
+    _login(url, user.username)
