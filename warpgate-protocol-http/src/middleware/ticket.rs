@@ -1,6 +1,7 @@
 use std::net::IpAddr;
 
 use poem::session::Session;
+use poem::web::cookie::CookieJar;
 use poem::web::{Data, FromRequest};
 use poem::{Endpoint, Middleware, Request};
 use serde::Deserialize;
@@ -12,7 +13,8 @@ use warpgate_common_http::{SessionAuthorization, authorization_token};
 use warpgate_core::authorize_and_spend_ticket;
 use warpgate_db_entities::Ticket;
 
-use crate::common::SessionExt;
+use crate::common::{SessionExt, storage_session_id};
+use crate::session_storage::SharedSessionStorage;
 
 /// Request-data marker for a header-borne ticket: the request runs on a
 /// detached session that is never stored, so the user session registered for
@@ -127,6 +129,25 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
                         target_id: authorization.target().id,
                         ticket_id: authorization.ticket_id(),
                     });
+
+                    // A cookie session gaining auth must get a fresh id, as a
+                    // password login does: otherwise a session id planted in
+                    // the victim's browser beforehand (session fixation) would
+                    // carry the ticket's access. Only on the first hop, since
+                    // cookies set by a forwarded request never reach the
+                    // client.
+                    if !session_is_temporary
+                        && !warpgate_common_http::is_cluster_peer_request(
+                            &req,
+                            &ctx.services().cluster.cluster_token,
+                        )
+                    {
+                        let jar = <&CookieJar>::from_request_without_body(&req).await?;
+                        Data::<&SharedSessionStorage>::from_request_without_body(&req)
+                            .await?
+                            .rotate_session_id(storage_session_id(jar), &session)
+                            .await?;
+                    }
                 }
             }
         }
