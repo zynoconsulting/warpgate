@@ -364,7 +364,14 @@ pub async fn authorize_session(
     // handle so the next request re-adopts fresh state with no leftover
     // watcher — the same mechanism the UserSessionAlreadyAttributed branch
     // above already relies on.
-    session_middleware.lock().await.remove_session(session);
+    //
+    // Only when the previous authorization was actually a ticket, though:
+    // a same-user step-up re-auth (web_auth_max_age_seconds) or an SSO
+    // re-login has no stale grant to protect against, and detaching there
+    // would needlessly kill this browser's already-open websockets/streams.
+    if matches!(session.get_auth(), Some(SessionAuthorization::Ticket { .. })) {
+        session_middleware.lock().await.remove_session(session);
+    }
 
     session.set_auth(SessionAuthorization::User {
         user_id: user_info.id,

@@ -137,7 +137,17 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
                     // (`ticket_session_key`), so a different ticket is a
                     // different session, not a reused one, and never sees
                     // this issue.
+                    //
+                    // Also skipped when the session had no authorization at
+                    // all yet — a half-finished login (a row already
+                    // registered, e.g. by a login attempt in progress, but
+                    // never attributed) has nothing running under a stale
+                    // grant to protect against, and detaching would just
+                    // burn this ticket's use on a re-adopted row with no
+                    // user, which the admission below can't attribute to and
+                    // so 401s.
                     if !session_is_temporary
+                        && session.get_auth().is_some()
                         && let Ok(session_store) =
                             Data::<&Arc<Mutex<SessionStore>>>::from_request_without_body(&req)
                                 .await

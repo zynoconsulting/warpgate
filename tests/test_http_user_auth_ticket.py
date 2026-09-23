@@ -311,3 +311,97 @@ class TestHTTPUserAuthTicket:
             "websocket opened under the ticket was not closed by the password login"
         )
         ws.close()
+
+    def test_ticket_after_a_half_finished_login_spends_exactly_one_use(
+        self,
+        echo_server_port,
+        shared_wg: WarpgateProcess,
+    ):
+        # A failed/incomplete login attempt registers a session row (to
+        # track the credential-checking state) before any
+        # SessionAuthorization is ever set on the cookie. Opening a ticket
+        # link in that same browser must not be treated as "switching
+        # grants" -- there is nothing running yet to protect, and detaching
+        # would re-adopt a row with no user, which the ticket admission
+        # can't attribute to (401), burning the ticket's one use for nothing.
+        url = f"https://localhost:{shared_wg.http_port}"
+        with admin_client(url) as api:
+            user, role = create_password_user(api)
+            echo_target = create_http_target(
+                api, role, echo_server_port, require_approval=False
+            )
+            ticket = api.create_ticket(
+                sdk.CreateTicketRequest(
+                    target_name=echo_target.name,
+                    username=user.username,
+                    number_of_uses=1,
+                )
+            )
+
+        session = requests.Session()
+        session.verify = False
+
+        # Registers a session row for this cookie without ever setting a
+        # SessionAuthorization on it.
+        login = session.post(
+            f"{url}/@warpgate/api/auth/login",
+            json={"username": user.username, "password": "wrong"},
+        )
+        assert login.status_code // 100 != 2
+
+        response = session.get(
+            f"{url}/some/path?warpgate-ticket={ticket.secret}",
+            allow_redirects=False,
+        )
+        assert response.status_code // 100 == 2
+        assert response.json()["path"] == "/some/path"
+
+        with admin_client(url) as api:
+            uses_left = next(
+                t.uses_left for t in api.get_tickets() if t.id == ticket.ticket.id
+            )
+        assert uses_left == 0
+
+    def test_password_relogin_as_the_same_user_keeps_websocket_alive(
+        self,
+        echo_server_port,
+        shared_wg: WarpgateProcess,
+    ):
+        # A same-user re-login (step-up re-auth, or an SSO callback
+        # completing again) must not disturb this browser's already-open
+        # websockets -- there is no stale ticket grant to protect against.
+        url = f"https://localhost:{shared_wg.http_port}"
+        with admin_client(url) as api:
+            user, role = create_password_user(api)
+            echo_target = create_http_target(
+                api, role, echo_server_port, require_approval=False
+            )
+
+        session = requests.Session()
+        session.verify = False
+        login = session.post(
+            f"{url}/@warpgate/api/auth/login",
+            json={"username": user.username, "password": "123"},
+        )
+        assert login.status_code // 100 == 2
+
+        cookies = session.cookies.get_dict()
+        cookie = "; ".join([f"{k}={v}" for k, v in cookies.items()])
+        ws = create_connection(
+            f"wss://localhost:{shared_wg.http_port}/socket?warpgate-target={echo_target.name}",
+            cookie=cookie,
+            sslopt={"cert_reqs": ssl.CERT_NONE},
+        )
+        ws.send("test")
+        assert ws.recv() == "test"
+
+        # Same cookie jar, same user, logging in again.
+        relogin = session.post(
+            f"{url}/@warpgate/api/auth/login",
+            json={"username": user.username, "password": "123"},
+        )
+        assert relogin.status_code // 100 == 2
+
+        ws.send("still alive")
+        assert ws.recv() == "still alive"
+        ws.close()
