@@ -1,9 +1,11 @@
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use poem::session::Session;
 use poem::web::{Data, FromRequest};
 use poem::{Endpoint, Middleware, Request};
 use serde::Deserialize;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 use warpgate_common::Secret;
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
@@ -13,6 +15,7 @@ use warpgate_core::authorize_and_spend_ticket;
 use warpgate_db_entities::Ticket;
 
 use crate::common::SessionExt;
+use crate::session::SessionStore;
 
 /// Request-data marker for a header-borne ticket: the request runs on a
 /// detached session that is never stored, so the user session registered for
@@ -121,6 +124,27 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
                 )
                 .await?
                 {
+                    // A cookie-backed session may already carry a watcher for
+                    // whatever grant it held before (a different ticket, or
+                    // none) — drop it before switching, so that grant being
+                    // revoked later can't close a session that no longer
+                    // depends on it. Skipped for a header-borne ticket: those
+                    // are keyed by ticket id (`ticket_session_key`), so a
+                    // different ticket is a different session, not a reused
+                    // one, and never sees this issue.
+                    if !session_is_temporary
+                        && let Ok(session_store) =
+                            Data::<&Arc<Mutex<SessionStore>>>::from_request_without_body(&req)
+                                .await
+                        && let Ok(handle) = session_store
+                            .lock()
+                            .await
+                            .handle_for_request(&req, &ctx)
+                            .await
+                    {
+                        handle.lock().await.clear_access_watches().await;
+                    }
+
                     session.set_auth(SessionAuthorization::Ticket {
                         user_id: authorization.user_info().id,
                         username: authorization.user_info().username.clone(),

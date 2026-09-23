@@ -91,6 +91,16 @@ impl WarpgateServerHandle {
         &self.user_session_state
     }
 
+    /// Drops every access watcher this node-local session state currently
+    /// holds, cancelling them. For when the session's authorization changes
+    /// to a different grant (or none) — e.g. a ticket-backed cookie session
+    /// then logging in as a full user, or presenting a different ticket —
+    /// so a watcher for a grant the session no longer relies on can't later
+    /// close it out from under whatever now legitimately authorizes it.
+    pub async fn clear_access_watches(&self) {
+        self.user_session_state.lock().await.access_watches.clear();
+    }
+
     pub async fn set_user_info(&self, user_info: AuthStateUserInfo) -> Result<(), WarpgateError> {
         {
             // Kubernetes reuses one session handle for many concurrent requests, so
@@ -273,18 +283,14 @@ impl WarpgateServerHandle {
 
         let id = self.user_session_id;
         let span = info_span!("Access", session = %id, session_username = %username);
+        let settings = AccessWatchSettings {
+            interval: self.access_watch.interval,
+            unconfirmed_limit: self.access_watch.unconfirmed_limit,
+            nudges,
+        };
         tokio::spawn(
-            crate::access_watch::watch(
-                self.db.clone(),
-                grant,
-                weak_handle,
-                token,
-                nudges,
-                self.access_watch.interval,
-                self.access_watch.unconfirmed_limit,
-                deadline,
-            )
-            .instrument(span),
+            crate::access_watch::watch(self.db.clone(), grant, weak_handle, token, settings, deadline)
+                .instrument(span),
         );
     }
 

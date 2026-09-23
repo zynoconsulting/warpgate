@@ -355,6 +355,12 @@ pub async fn authorize_session(
             .await?;
     }
 
+    // A ticket-backed cookie session that then logs in as a full user must
+    // not keep a watcher for whatever ticket it started under — that ticket
+    // being revoked later must not close a session that no longer depends
+    // on it.
+    server_handle.lock().await.clear_access_watches().await;
+
     session.set_auth(SessionAuthorization::User {
         user_id: user_info.id,
         username: user_info.username,

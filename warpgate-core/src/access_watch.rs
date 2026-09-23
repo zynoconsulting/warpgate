@@ -8,7 +8,7 @@
 //! `uses_left` is never part of that liveness: exhausting a ticket's uses
 //! must stop *new* admissions, not end a session it already let in.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect};
 use time::OffsetDateTime;
@@ -105,18 +105,24 @@ pub(crate) struct AccessWatchSettings {
 /// Whether a watcher that just failed to check its grant should give up and
 /// close the session, given when it last confirmed the grant was live.
 ///
+/// `last_ok`/`now` are a monotonic [`Instant`] — not wall-clock time — so a
+/// clock step (NTP, suspend/resume) can't stretch or erase the unconfirmed
+/// window; `deadline`/`wall_now` stay wall-clock since a ticket's own expiry
+/// is a wall-clock value.
+///
 /// Pulled out of [`watch`] so the close policy — not the polling around it —
 /// is what gets unit tested.
 fn close_on_error(
-    last_ok: OffsetDateTime,
-    now: OffsetDateTime,
+    last_ok: Instant,
+    now: Instant,
     deadline: Option<OffsetDateTime>,
+    wall_now: OffsetDateTime,
     unconfirmed_limit: Duration,
 ) -> bool {
-    if deadline.is_some_and(|deadline| deadline <= now) {
+    if deadline.is_some_and(|deadline| deadline <= wall_now) {
         return true;
     }
-    (now - last_ok).unsigned_abs() >= unconfirmed_limit
+    now.saturating_duration_since(last_ok) >= unconfirmed_limit
 }
 
 /// Re-checks `grant` on `interval` (or sooner, on a nudge or a known
@@ -131,12 +137,20 @@ pub(crate) async fn watch(
     grant: AccessGrant,
     handle: WeakSessionHandle,
     stop: CancellationToken,
-    mut nudges: watch::Receiver<u64>,
-    interval: Duration,
-    unconfirmed_limit: Duration,
+    settings: AccessWatchSettings,
     mut deadline: Option<OffsetDateTime>,
 ) {
-    let mut last_ok = OffsetDateTime::now_utc();
+    let AccessWatchSettings {
+        interval,
+        unconfirmed_limit,
+        mut nudges,
+    } = settings;
+    let mut last_ok = Instant::now();
+    // Latched once `nudges.changed()` errors (all senders gone): after that
+    // it would resolve immediately forever, turning the sleep/nudge select
+    // below into a busy loop. `State`'s sender realistically outlives every
+    // watcher, so this is a belt-and-braces guard, not an expected path.
+    let mut nudges_alive = true;
 
     loop {
         let now = OffsetDateTime::now_utc();
@@ -150,22 +164,61 @@ pub(crate) async fn watch(
             biased;
             () = stop.cancelled() => return,
             () = tokio::time::sleep(wake_in) => {}
-            _ = nudges.changed() => {}
+            result = async {
+                if nudges_alive {
+                    nudges.changed().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                if result.is_err() {
+                    nudges_alive = false;
+                }
+            }
         }
 
-        match grant.check(&db, OffsetDateTime::now_utc()).await {
-            Ok(Liveness::Live { until }) => {
+        // Timed out and raced against `stop` too: an unbounded `.await` here
+        // would let one hung query block the loop forever, silently
+        // defeating both the unconfirmed-limit and the deadline it exists to
+        // enforce.
+        let outcome = tokio::select! {
+            biased;
+            () = stop.cancelled() => return,
+            outcome = tokio::time::timeout(interval, grant.check(&db, OffsetDateTime::now_utc())) => outcome,
+        };
+        match outcome {
+            Ok(Ok(Liveness::Live { until })) => {
                 deadline = until;
-                last_ok = OffsetDateTime::now_utc();
+                last_ok = Instant::now();
             }
-            Ok(dead) => {
+            Ok(Ok(dead)) => {
                 warn!(?grant, ?dead, "Closing session: access grant is no longer live");
                 handle.close();
                 return;
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 warn!(%error, ?grant, "Failed to re-check access grant");
-                if close_on_error(last_ok, OffsetDateTime::now_utc(), deadline, unconfirmed_limit) {
+                if close_on_error(
+                    last_ok,
+                    Instant::now(),
+                    deadline,
+                    OffsetDateTime::now_utc(),
+                    unconfirmed_limit,
+                ) {
+                    warn!(?grant, "Closing session: access grant could not be confirmed in time");
+                    handle.close();
+                    return;
+                }
+            }
+            Err(_timed_out) => {
+                warn!(?grant, ?interval, "Access grant check timed out");
+                if close_on_error(
+                    last_ok,
+                    Instant::now(),
+                    deadline,
+                    OffsetDateTime::now_utc(),
+                    unconfirmed_limit,
+                ) {
                     warn!(?grant, "Closing session: access grant could not be confirmed in time");
                     handle.close();
                     return;
@@ -328,35 +381,45 @@ mod tests {
 
     #[test]
     fn close_on_error_policy() {
-        let now = OffsetDateTime::now_utc();
+        let start = Instant::now();
+        let wall_now = OffsetDateTime::now_utc();
         let limit = Duration::from_secs(15);
 
         // A deadline that has already passed closes immediately, even if the
         // last successful check was a moment ago.
-        assert!(close_on_error(now, now, Some(now - time::Duration::seconds(1)), limit));
+        assert!(close_on_error(
+            start,
+            start,
+            Some(wall_now - time::Duration::seconds(1)),
+            wall_now,
+            limit
+        ));
 
         // No deadline, and the unconfirmed limit not yet reached: keep going.
-        assert!(!close_on_error(now, now, None, limit));
+        assert!(!close_on_error(start, start, None, wall_now, limit));
         assert!(!close_on_error(
-            now,
-            now + time::Duration::seconds(10),
+            start,
+            start + Duration::from_secs(10),
             None,
+            wall_now,
             limit
         ));
 
         // No deadline, but too long since the last confirmed-live check.
         assert!(close_on_error(
-            now,
-            now + time::Duration::seconds(15),
+            start,
+            start + Duration::from_secs(15),
             None,
+            wall_now,
             limit
         ));
 
         // A future deadline does not by itself excuse a stale confirmation.
         assert!(close_on_error(
-            now,
-            now + time::Duration::seconds(20),
-            Some(now + time::Duration::hours(1)),
+            start,
+            start + Duration::from_secs(20),
+            Some(wall_now + time::Duration::hours(1)),
+            wall_now,
             limit
         ));
     }
