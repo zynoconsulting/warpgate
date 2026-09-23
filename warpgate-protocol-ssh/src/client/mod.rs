@@ -760,12 +760,22 @@ impl Connector {
 
         let config = self.build_ssh_config(&first).await;
         let address_str = format!("{}:{}", first.host, first.port);
-        let address = address_str
+        // Every resolved address, not just the first: `localhost` commonly
+        // resolves to `::1` ahead of `127.0.0.1`, and a target listening only
+        // on IPv4 must still be reachable. The connect tries each in turn.
+        let addresses = address_str
             .to_socket_addrs()
             .map_err(ConnectionError::Io)
-            .and_then(|mut x| x.next().ok_or(ConnectionError::Resolve))
+            .map(Iterator::collect::<Vec<_>>)
+            .and_then(|x| {
+                if x.is_empty() {
+                    Err(ConnectionError::Resolve)
+                } else {
+                    Ok(x)
+                }
+            })
             .inspect_err(|e| error!(?e, address=%address_str, "Cannot resolve address"))?;
-        info!(?address, username = %first.username, "Connecting");
+        info!(?addresses, username = %first.username, "Connecting");
         let (event_tx, event_rx) = unbounded_channel();
         let handler = ClientHandler {
             ssh_options: first.clone(),
@@ -773,7 +783,7 @@ impl Connector {
             services: self.services.clone(),
             session_id: self.id,
         };
-        let fut = russh::client::connect(config, address, handler);
+        let fut = russh::client::connect(config, &addresses[..], handler);
         let (mut session, mut active_rx) = self
             .wait_for_connection(&first, fut, event_rx, false)
             .boxed()
