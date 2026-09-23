@@ -473,8 +473,8 @@ pub(crate) async fn delete_ticket(
 
 /// Deletes a ticket and ends every session it authorized, on every node in
 /// the cluster: `delete_ticket` alone would leave an already-admitted
-/// session running until its access watcher's next poll (or, for a ticket
-/// with no expiry, indefinitely).
+/// session running until its access watcher's next poll (up to its interval,
+/// a few seconds, later) instead of closing it right away.
 pub async fn revoke_ticket(
     services: &crate::Services,
     ticket_id: Uuid,
