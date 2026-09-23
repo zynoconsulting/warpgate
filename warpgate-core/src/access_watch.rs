@@ -33,25 +33,60 @@ pub(crate) const DEFAULT_UNCONFIRMED_LIMIT: Duration = Duration::from_secs(15);
 /// Overrides [`DEFAULT_INTERVAL`] (and, proportionally,
 /// [`DEFAULT_UNCONFIRMED_LIMIT`]) when set to a valid number of seconds — a
 /// pytest-only knob, in the same spirit as `WARPGATE_UNDER_TEST`
-/// (`warpgate_common::helpers::hash`). Used to prove a cross-node cluster
-/// notification actually delivered a revoke, rather than a node's own
-/// periodic poll coincidentally landing inside a short test deadline: set
-/// this long on one node and only the notification can close a session
-/// within the deadline.
+/// (`warpgate_common::helpers::hash`), and only honoured alongside it (see
+/// [`default_timing`]). Used to prove a cross-node cluster notification
+/// actually delivered a revoke, rather than a node's own periodic poll
+/// coincidentally landing inside a short test deadline: set this long on one
+/// node and only the notification can close a session within the deadline.
 const INTERVAL_OVERRIDE_ENV_VAR: &str = "WARPGATE_ACCESS_WATCH_INTERVAL_SECS";
 
+/// Valid range for [`INTERVAL_OVERRIDE_ENV_VAR`], in seconds. `0` would spin
+/// the watch loop hot; anything above an hour is not a plausible test
+/// interval and, without a ceiling, `interval * 3` for the unconfirmed limit
+/// could overflow `Duration`'s arithmetic and panic.
+const INTERVAL_OVERRIDE_RANGE: std::ops::RangeInclusive<u64> = 1..=3600;
+
 /// The (interval, unconfirmed_limit) pair a fresh [`crate::State`] starts
-/// with — the hardcoded defaults, unless [`INTERVAL_OVERRIDE_ENV_VAR`] names
-/// a valid interval.
+/// with — the hardcoded defaults, unless running under test
+/// (`WARPGATE_UNDER_TEST` is set — the same flag production never sets) and
+/// [`INTERVAL_OVERRIDE_ENV_VAR`] names an interval within
+/// [`INTERVAL_OVERRIDE_RANGE`]. Gating on `WARPGATE_UNDER_TEST` too means the
+/// override variable being set for some unrelated reason can never change a
+/// production deployment's polling.
 pub(crate) fn default_timing() -> (Duration, Duration) {
-    let Some(interval) = std::env::var(INTERVAL_OVERRIDE_ENV_VAR)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_secs)
-    else {
+    let Ok(raw) = std::env::var(INTERVAL_OVERRIDE_ENV_VAR) else {
         return (DEFAULT_INTERVAL, DEFAULT_UNCONFIRMED_LIMIT);
     };
-    (interval, interval * 3)
+
+    if std::env::var("WARPGATE_UNDER_TEST")
+        .unwrap_or_default()
+        .is_empty()
+    {
+        warn!(
+            value = %raw,
+            "{INTERVAL_OVERRIDE_ENV_VAR} is set but WARPGATE_UNDER_TEST is not; ignoring it"
+        );
+        return (DEFAULT_INTERVAL, DEFAULT_UNCONFIRMED_LIMIT);
+    }
+
+    match raw.parse::<u64>() {
+        Ok(seconds) if INTERVAL_OVERRIDE_RANGE.contains(&seconds) => {
+            warn!(
+                seconds,
+                "{INTERVAL_OVERRIDE_ENV_VAR} is overriding the access-watch poll interval"
+            );
+            let interval = Duration::from_secs(seconds);
+            (interval, interval * 3)
+        }
+        _ => {
+            warn!(
+                value = %raw,
+                range = ?INTERVAL_OVERRIDE_RANGE,
+                "{INTERVAL_OVERRIDE_ENV_VAR} is not a whole number of seconds in range; ignoring it"
+            );
+            (DEFAULT_INTERVAL, DEFAULT_UNCONFIRMED_LIMIT)
+        }
+    }
 }
 
 /// What a target session's admission was granted under. Only a ticket today;
