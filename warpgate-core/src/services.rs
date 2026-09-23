@@ -75,6 +75,7 @@ impl Services {
         &self,
         sessions: AdmittedSessions,
     ) -> Result<(), WarpgateError> {
+        self.cluster.notify_global(ClusterNotification::AccessRevoked);
         if sessions.0.is_empty() {
             return Ok(());
         }
@@ -261,6 +262,27 @@ impl Services {
                     }
                     if let Err(error) = services.close_sessions_without_role_access().await {
                         warn!("Failed to close sessions without role access: {error}");
+                    }
+                }
+            });
+        }
+
+        // Bridge cluster-wide revoke notifications into this node's access
+        // watchers. `notify_global` already delivers to this node locally
+        // (no round trip through HTTP), and a peer relays the same message
+        // here via the cluster notifications endpoint.
+        {
+            let mut rx = services.cluster.subscribe();
+            let state = services.state.clone();
+            tokio::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(ClusterNotification::AccessRevoked)
+                        | Err(broadcast::error::RecvError::Lagged(_)) => {
+                            state.lock().await.nudge_access_watchers();
+                        }
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
             });
