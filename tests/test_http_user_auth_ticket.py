@@ -321,9 +321,9 @@ class TestHTTPUserAuthTicket:
         # track the credential-checking state) before any
         # SessionAuthorization is ever set on the cookie. Opening a ticket
         # link in that same browser must not be treated as "switching
-        # grants" -- there is nothing running yet to protect, and detaching
-        # would re-adopt a row with no user, which the ticket admission
-        # can't attribute to (401), burning the ticket's one use for nothing.
+        # grants" -- there is nothing running yet to protect, so this must
+        # go through the still-live in-memory entry rather than an
+        # unnecessary detach-and-readopt round trip.
         url = f"https://localhost:{shared_wg.http_port}"
         with admin_client(url) as api:
             user, role = create_password_user(api)

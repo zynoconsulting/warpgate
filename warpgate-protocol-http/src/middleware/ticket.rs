@@ -142,10 +142,9 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
                     // all yet — a half-finished login (a row already
                     // registered, e.g. by a login attempt in progress, but
                     // never attributed) has nothing running under a stale
-                    // grant to protect against, and detaching would just
-                    // burn this ticket's use on a re-adopted row with no
-                    // user, which the admission below can't attribute to and
-                    // so 401s.
+                    // grant to protect against, so detaching would only cost
+                    // a needless round trip through the store (the re-adopt
+                    // below accepts an unattributed row regardless).
                     if !session_is_temporary
                         && session.get_auth().is_some()
                         && let Ok(session_store) =
