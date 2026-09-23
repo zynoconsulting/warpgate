@@ -30,7 +30,7 @@ use crate::auth::submit_credential;
 use crate::login_protection::FailedAttemptInfo;
 use crate::{
     ApprovedTarget, AuthorizedIdentity, ConfigProvider, Services, TargetAuthorization,
-    authorize_and_spend_ticket, authorize_for_target, grant_active_self_service_ticket,
+    authorize_active_self_service_ticket, authorize_and_spend_ticket, authorize_for_target,
     wait_for_auth_completion,
 };
 
@@ -420,8 +420,8 @@ async fn authorize_for_target_or_ticket(
         return Ok(None);
     }
 
-    let Some(ticket_id) =
-        grant_active_self_service_ticket(&services.db, identity.user_info().id, target.id).await?
+    let Some(authorization) =
+        authorize_active_self_service_ticket(&services.db, identity.clone(), target).await?
     else {
         return Ok(None);
     };
@@ -431,12 +431,7 @@ async fn authorize_for_target_or_ticket(
         username = %identity.user_info().username,
         "Authorized target access with an activated self-service ticket"
     );
-    Ok(Some(TargetAuthorization::for_ticket_session(
-        identity.user_info().clone(),
-        target,
-        ticket_id,
-        identity.protocol(),
-    )?))
+    Ok(Some(authorization))
 }
 
 async fn record_password_failure(
