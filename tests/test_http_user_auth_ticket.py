@@ -362,6 +362,87 @@ class TestHTTPUserAuthTicket:
             )
         assert uses_left == 0
 
+    def test_second_ticket_after_an_unattributed_ticket_session_is_granted(
+        self,
+        echo_server_port,
+        shared_wg: WarpgateProcess,
+    ):
+        # A ticket's cookie session can end up with a `SessionAuthorization`
+        # but an unattributed `user_sessions` row: proxying to a target is
+        # what stamps a user onto the row (`start_target_session`), and
+        # ticket auth otherwise only ever sets the cookie's authorization
+        # directly. A ticket link that only ever hits a non-proxy route
+        # (e.g. `/@warpgate/api/info`) leaves the row unattributed. Presenting
+        # a second ticket on that same browser then detaches the live entry
+        # and forces a DB re-adopt, which must accept that unattributed row
+        # (the live-entry equivalent already does) -- not 401 and burn the
+        # second ticket's use for nothing.
+        url = f"https://localhost:{shared_wg.http_port}"
+        with admin_client(url) as api:
+            user, role = create_password_user(api)
+            echo_target = create_http_target(
+                api, role, echo_server_port, require_approval=False
+            )
+            first_ticket = api.create_ticket(
+                sdk.CreateTicketRequest(
+                    target_name=echo_target.name,
+                    username=user.username,
+                    number_of_uses=1,
+                )
+            )
+            second_ticket = api.create_ticket(
+                sdk.CreateTicketRequest(
+                    target_name=echo_target.name,
+                    username=user.username,
+                    number_of_uses=1,
+                )
+            )
+
+        session = requests.Session()
+        session.verify = False
+
+        # Registers a session row for this cookie without ever setting a
+        # SessionAuthorization on it.
+        login = session.post(
+            f"{url}/@warpgate/api/auth/login",
+            json={"username": user.username, "password": "wrong"},
+        )
+        assert login.status_code // 100 != 2
+
+        # The first ticket is only ever presented on a non-proxy route, so
+        # its cookie session gets a `SessionAuthorization` but its
+        # `user_sessions` row (registered by the login attempt above) is
+        # never attributed to a user.
+        response = session.get(
+            f"{url}/@warpgate/api/info?warpgate-ticket={first_ticket.secret}",
+            allow_redirects=False,
+        )
+        assert response.status_code // 100 == 2
+
+        with admin_client(url) as api:
+            uses_left = next(
+                t.uses_left for t in api.get_tickets() if t.id == first_ticket.ticket.id
+            )
+        assert uses_left == 0
+
+        # The second ticket detaches the live entry (it is switching this
+        # session away from the first ticket's grant) and must re-adopt the
+        # still-unattributed row rather than 401 on it.
+        response = session.get(
+            f"{url}/some/path?warpgate-ticket={second_ticket.secret}",
+            allow_redirects=False,
+        )
+        assert response.status_code // 100 == 2
+        assert response.json()["path"] == "/some/path"
+
+        with admin_client(url) as api:
+            uses_left = next(
+                t.uses_left
+                for t in api.get_tickets()
+                if t.id == second_ticket.ticket.id
+            )
+        assert uses_left == 0
+
     def test_password_relogin_as_the_same_user_keeps_websocket_alive(
         self,
         echo_server_port,
