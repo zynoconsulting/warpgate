@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use poem::Request;
 use tokio::sync::Mutex;
+use tokio_util::sync::{CancellationToken, DropGuard};
 use uuid::Uuid;
 use warpgate_common::auth::{AuthResult, AuthStateUserInfo, RememberApprovalBy};
 use warpgate_common::{TargetKubernetesOptions, UserSessionId, WarpgateError};
@@ -72,6 +73,15 @@ struct SessionEntry {
     handle: Arc<Mutex<WarpgateServerHandle>>,
     created: Instant,
     authorization: SharedAuthorization,
+    /// Cancelled when the session's handle is closed (admin close, or its
+    /// ticket being revoked) — raced against in-flight requests in
+    /// `server::handlers`, since a correlated session's fan-out of requests
+    /// otherwise only gets re-admitted at its *next* `kubectl` call.
+    closed: CancellationToken,
+    /// Cancels a clone of `closed` on drop, so the task that evicts this
+    /// entry on close stops instead of leaking when the entry is instead
+    /// removed some other way (a denial, a vacuum).
+    _stop_evictor: DropGuard,
 }
 
 pub struct RequestCorrelator {
@@ -95,7 +105,7 @@ pub async fn correlated_authorization(
     identity: KubernetesIdentity,
     target_name: &str,
     services: &Services,
-) -> poem::Result<(Arc<Mutex<WarpgateServerHandle>>, AdmittedSession)> {
+) -> poem::Result<(Arc<Mutex<WarpgateServerHandle>>, AdmittedSession, CancellationToken)> {
     let user_info = identity.user_info();
     let key = CorrelationKey::for_request(request, &identity, services, target_name.into()).await;
     let max_age = services
@@ -116,8 +126,9 @@ pub async fn correlated_authorization(
         // take minutes, and that request needs the correlator lock to clean up
         // after a denial.
         let existing = correlator.lock().await.entry(&key, max_age);
-        if let Some((handle, slot)) = existing
-            && let Some(joined) = join_session(correlator, &key, handle, slot, services).await?
+        if let Some((handle, slot, closed)) = existing
+            && let Some(joined) =
+                join_session(correlator, &key, handle, slot, closed, services).await?
         {
             return Ok(joined);
         }
@@ -125,24 +136,46 @@ pub async fn correlated_authorization(
         // Registered outside the correlator lock so that concurrent first
         // requests don't serialise on its database insert. A handle that then
         // loses the race below is dropped, deleting the session it just opened.
-        let handle = register_pending_session(services, request, &user_info).await?;
+        let (handle, closed) = register_pending_session(services, request, &user_info).await?;
         let session_id = handle.lock().await.user_session_id();
 
         let slot = SharedAuthorization::default();
         let claimed = {
-            let mut correlator = correlator.lock().await;
-            if correlator.entry(&key, max_age).is_some() {
+            let mut correlator_state = correlator.lock().await;
+            if correlator_state.entry(&key, max_age).is_some() {
                 None
             } else {
                 // Locked before the correlator lock is released, so a request
                 // joining this session can't reach the pending slot ahead of us.
                 let guard = slot.clone().lock_owned().await;
-                correlator.handles.insert(
+                // Evicts the entry the moment its session closes (admin close,
+                // or a revoked ticket), instead of leaving it to the periodic
+                // vacuum: that promptly drops the last `WarpgateServerHandle`
+                // reference, which is what ends the session's DB row.
+                let stop = CancellationToken::new();
+                tokio::spawn({
+                    let correlator = correlator.clone();
+                    let key = key.clone();
+                    let slot = slot.clone();
+                    let closed = closed.clone();
+                    let stop = stop.clone();
+                    async move {
+                        tokio::select! {
+                            () = closed.cancelled() => {
+                                correlator.lock().await.evict(&key, &slot);
+                            }
+                            () = stop.cancelled() => {}
+                        }
+                    }
+                });
+                correlator_state.handles.insert(
                     key.clone(),
                     SessionEntry {
                         handle: handle.clone(),
                         created: Instant::now(),
                         authorization: slot.clone(),
+                        closed: closed.clone(),
+                        _stop_evictor: stop.drop_guard(),
                     },
                 );
                 Some(guard)
@@ -184,7 +217,7 @@ pub async fn correlated_authorization(
                     };
                 handle.lock().await.confirm();
                 *authorization = Authorization::Authorized(admitted.clone());
-                Ok((handle, admitted))
+                Ok((handle, admitted, closed))
             }
             Err(error) => {
                 // A denied attempt is not cached: the requests waiting on this
@@ -233,12 +266,13 @@ async fn join_session(
     key: &CorrelationKey,
     handle: Arc<Mutex<WarpgateServerHandle>>,
     slot: SharedAuthorization,
+    closed: CancellationToken,
     services: &Services,
-) -> poem::Result<Option<(Arc<Mutex<WarpgateServerHandle>>, AdmittedSession)>> {
+) -> poem::Result<Option<(Arc<Mutex<WarpgateServerHandle>>, AdmittedSession, CancellationToken)>> {
     // Cloned out so the slot lock is not held while taking the correlator lock.
     let outcome = slot.lock().await.clone();
     match outcome {
-        Authorization::Authorized(admitted) => Ok(Some((handle, admitted))),
+        Authorization::Authorized(admitted) => Ok(Some((handle, admitted, closed))),
         Authorization::Denied => Err(unauthorized()),
         Authorization::Pending => {
             correlator.lock().await.evict(key, &slot);
@@ -286,14 +320,15 @@ async fn register_pending_session(
     services: &Services,
     request: &Request,
     user_info: &AuthStateUserInfo,
-) -> Result<Arc<Mutex<WarpgateServerHandle>>, WarpgateError> {
+) -> Result<(Arc<Mutex<WarpgateServerHandle>>, CancellationToken), WarpgateError> {
     let ip = get_client_ip(request, services).await;
+    let (session_handle, closed) = KubernetesSessionHandle::new();
     let handle = State::register_node_local_user_session(
         &services.state,
         crate::PROTOCOL_NAME,
         UserSessionStateInit {
             remote_address: ip.and_then(|x| x.parse().ok()),
-            handle: Box::new(KubernetesSessionHandle),
+            handle: Box::new(session_handle),
         },
     )
     .await?;
@@ -304,7 +339,7 @@ async fn register_pending_session(
         // waiting for approval is attributable while it waits.
         handle.set_user_info(user_info.clone()).await?;
     }
-    Ok(handle)
+    Ok((handle, closed))
 }
 
 impl RequestCorrelator {
@@ -324,12 +359,22 @@ impl RequestCorrelator {
         &self,
         key: &CorrelationKey,
         max_age: Duration,
-    ) -> Option<(Arc<Mutex<WarpgateServerHandle>>, SharedAuthorization)> {
+    ) -> Option<(
+        Arc<Mutex<WarpgateServerHandle>>,
+        SharedAuthorization,
+        CancellationToken,
+    )> {
         self.handles
             .get(key)
             // Enforce the bound at lookup, not just on the periodic vacuum.
-            .filter(|entry| entry.created.elapsed() < max_age)
-            .map(|entry| (entry.handle.clone(), entry.authorization.clone()))
+            .filter(|entry| entry.created.elapsed() < max_age && !entry.closed.is_cancelled())
+            .map(|entry| {
+                (
+                    entry.handle.clone(),
+                    entry.authorization.clone(),
+                    entry.closed.clone(),
+                )
+            })
     }
 
     fn was_refused(&self, key: &CorrelationKey) -> bool {
@@ -359,8 +404,9 @@ impl RequestCorrelator {
             .kubernetes
             .session_max_age;
         let now = Instant::now();
-        self.handles
-            .retain(|_, entry| now.duration_since(entry.created) < max_age);
+        self.handles.retain(|_, entry| {
+            now.duration_since(entry.created) < max_age && !entry.closed.is_cancelled()
+        });
         self.refusals
             .retain(|_, at| now.duration_since(*at) < REFUSAL_MEMORY);
     }

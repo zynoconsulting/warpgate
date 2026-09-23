@@ -10,6 +10,7 @@ use reqwest_websocket::Upgrade;
 use serde::Deserialize;
 use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::tungstenite;
+use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, warn};
 use url::Url;
 use warpgate_common::helpers::websocket::pump_websocket;
@@ -27,7 +28,7 @@ use crate::audit::{StreamOperation, classify_mutating, classify_stream};
 use crate::correlator::{AdmittedSession, RequestCorrelator, correlated_authorization};
 use crate::recording::{start_recording_api, start_recording_exec};
 use crate::server::auth::{
-    KubernetesIdentity, authenticate_kubernetes_user, create_authenticated_client,
+    KubernetesIdentity, authenticate_kubernetes_user, create_authenticated_client, unauthorized,
 };
 
 /// A client-supplied impersonation header (`Impersonate-User`,
@@ -135,8 +136,13 @@ pub async fn handle_api_request(
         .path()
         .to_owned();
 
-    let (handle, admitted) =
+    let (handle, admitted, closed) =
         correlated_authorization(correlator.0, req, identity, &target_name, ctx.services()).await?;
+    // The correlated session could have been closed (admin close, or its
+    // ticket revoked) between being looked up and reaching here.
+    if closed.is_cancelled() {
+        return Err(unauthorized());
+    }
 
     let (user_session_id, log_span) = {
         // The user info is already on the session: it is set when the session is
@@ -172,6 +178,7 @@ pub async fn handle_api_request(
                 &api_path,
                 &audit_subject,
                 ctx.services(),
+                closed.clone(),
             )
             .await
             .map(IntoResponse::into_response)
@@ -187,6 +194,7 @@ pub async fn handle_api_request(
                 &api_path,
                 &audit_subject,
                 ctx.services(),
+                closed,
             )
             .await
             .map(IntoResponse::into_response)
@@ -233,6 +241,7 @@ async fn _handle_normal_request_inner(
     api_path: &str,
     audit_subject: &KubernetesAuditSubject,
     services: &Services,
+    closed: CancellationToken,
 ) -> Result<Response, WarpgateError> {
     let user_info = admitted.user_info();
     let k8s_options = admitted.options();
@@ -353,7 +362,15 @@ async fn _handle_normal_request_inner(
         "Sending request to upstream Kubernetes API"
     );
 
-    let response = request_builder.send().await?;
+    // A correlated session can be admitted once and reused for a long time
+    // (up to `session_max_age`); racing every request against `closed` is
+    // what makes a mid-session revoke or admin close take effect immediately
+    // rather than only on the session's next re-admission.
+    let response = tokio::select! {
+        biased;
+        () = closed.cancelled() => return Err(WarpgateError::TargetAccessRevoked),
+        result = request_builder.send() => result?,
+    };
 
     let status = response.status();
     let response_headers = response.headers().clone();
@@ -397,14 +414,23 @@ async fn _handle_normal_request_inner(
 
         if transfer_encoding == "chunked" || is_streaming_response {
             (
-                Body::from_bytes_stream(response.bytes_stream().map_err(std::io::Error::other)),
+                Body::from_bytes_stream(
+                    response
+                        .bytes_stream()
+                        .map_err(std::io::Error::other)
+                        // A `kubectl logs -f`/`watch=true` stream can run for as
+                        // long as the ticket that opened it; end it here rather
+                        // than only on the session's next request.
+                        .take_until(closed.clone().cancelled_owned()),
+                ),
                 None,
             )
         } else {
-            let bytes = response
-                .bytes()
-                .await
-                .context("reading kubernetes response")?;
+            let bytes = tokio::select! {
+                biased;
+                () = closed.cancelled() => return Err(WarpgateError::TargetAccessRevoked),
+                result = response.bytes() => result.context("reading kubernetes response")?,
+            };
 
             (Body::from_bytes(bytes.clone()), Some(bytes.to_vec()))
         }
@@ -492,6 +518,7 @@ async fn _handle_websocket_request_inner(
     api_path: &str,
     audit_subject: &KubernetesAuditSubject,
     services: &Services,
+    closed: CancellationToken,
 ) -> anyhow::Result<impl IntoResponse> {
     let user_info = admitted.user_info();
     let k8s_options = admitted.options();
@@ -540,13 +567,15 @@ async fn _handle_websocket_request_inner(
     let audit_subject = audit_subject.clone();
 
     let ws_handler_inner = async move |socket: WebSocketStream| {
-        let client_response = client
-            .get(full_url.clone())
-            .upgrade()
-            .protocols(vec![ws_protocol])
-            .send()
-            .await
-            .context("sending websocket request to Kubernetes API")?;
+        let client_response = tokio::select! {
+            biased;
+            () = closed.cancelled() => bail!("Session closed while upgrading the Kubernetes websocket"),
+            result = client
+                .get(full_url.clone())
+                .upgrade()
+                .protocols(vec![ws_protocol])
+                .send() => result.context("sending websocket request to Kubernetes API")?,
+        };
 
         let status = client_response.status();
         let established = status == http::StatusCode::SWITCHING_PROTOCOLS;
@@ -602,8 +631,13 @@ async fn _handle_websocket_request_inner(
         });
 
         // Whichever direction ends first takes the stream down; the other is
-        // dropped rather than left to fail writing into the closed socket.
+        // dropped rather than left to fail writing into the closed socket. A
+        // session close (admin close, or its ticket revoked) takes the
+        // stream down the same way — otherwise a long-lived `exec`/`attach`/
+        // `port-forward` would outlive the access that opened it.
         let result = tokio::select! {
+            biased;
+            () = closed.cancelled() => Ok(()),
             result = server_to_client => result,
             result = client_to_server => result,
         };
