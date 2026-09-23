@@ -41,6 +41,7 @@ impl State {
         node_id: NodeId,
     ) -> Arc<Mutex<Self>> {
         let sender = broadcast::channel(2).0;
+        let (access_watch_interval, access_watch_unconfirmed_limit) = access_watch::default_timing();
         Arc::new(Mutex::new(Self {
             user_sessions: HashMap::new(),
             db: db.clone(),
@@ -48,8 +49,8 @@ impl State {
             rate_limiter_registry: rate_limiter_registry.clone(),
             change_sender: sender,
             access_watch_nudges: Arc::new(watch::channel(0u64).0),
-            access_watch_interval: access_watch::DEFAULT_INTERVAL,
-            access_watch_unconfirmed_limit: access_watch::DEFAULT_UNCONFIRMED_LIMIT,
+            access_watch_interval,
+            access_watch_unconfirmed_limit,
         }))
     }
 

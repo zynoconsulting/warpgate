@@ -30,6 +30,30 @@ pub(crate) const DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
 /// hiccup must not take down every ticket session in the cluster.
 pub(crate) const DEFAULT_UNCONFIRMED_LIMIT: Duration = Duration::from_secs(15);
 
+/// Overrides [`DEFAULT_INTERVAL`] (and, proportionally,
+/// [`DEFAULT_UNCONFIRMED_LIMIT`]) when set to a valid number of seconds — a
+/// pytest-only knob, in the same spirit as `WARPGATE_UNDER_TEST`
+/// (`warpgate_common::helpers::hash`). Used to prove a cross-node cluster
+/// notification actually delivered a revoke, rather than a node's own
+/// periodic poll coincidentally landing inside a short test deadline: set
+/// this long on one node and only the notification can close a session
+/// within the deadline.
+const INTERVAL_OVERRIDE_ENV_VAR: &str = "WARPGATE_ACCESS_WATCH_INTERVAL_SECS";
+
+/// The (interval, unconfirmed_limit) pair a fresh [`crate::State`] starts
+/// with — the hardcoded defaults, unless [`INTERVAL_OVERRIDE_ENV_VAR`] names
+/// a valid interval.
+pub(crate) fn default_timing() -> (Duration, Duration) {
+    let Some(interval) = std::env::var(INTERVAL_OVERRIDE_ENV_VAR)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+    else {
+        return (DEFAULT_INTERVAL, DEFAULT_UNCONFIRMED_LIMIT);
+    };
+    (interval, interval * 3)
+}
+
 /// What a target session's admission was granted under. Only a ticket today;
 /// the `zyno/database-ticket-jit` branch adds a `SelfService` variant for
 /// role-based access minted just-in-time, which is why this is kept as an
@@ -180,11 +204,14 @@ pub(crate) async fn watch(
         // Timed out and raced against `stop` too: an unbounded `.await` here
         // would let one hung query block the loop forever, silently
         // defeating both the unconfirmed-limit and the deadline it exists to
-        // enforce.
+        // enforce. Floored at 1s so a tiny test interval can't turn an
+        // ordinarily-fine, merely-slow SQLite check into a close-triggering
+        // timeout.
+        let check_timeout = interval.max(Duration::from_secs(1));
         let outcome = tokio::select! {
             biased;
             () = stop.cancelled() => return,
-            outcome = tokio::time::timeout(interval, grant.check(&db, OffsetDateTime::now_utc())) => outcome,
+            outcome = tokio::time::timeout(check_timeout, grant.check(&db, OffsetDateTime::now_utc())) => outcome,
         };
         match outcome {
             Ok(Ok(Liveness::Live { until })) => {

@@ -89,7 +89,16 @@ class Test:
         # A ticket session admitted on node A; its access watcher lives only
         # there. Revoking the ticket from node B must reach it through the
         # cluster notification the revoke sends, not a local nudge.
-        node_a = processes.start_wg()
+        #
+        # Node A's own poll interval is set far longer than the test: with
+        # the default 5s interval, a delete landing just before A's next
+        # scheduled poll would close the session almost immediately even if
+        # the cross-node notification were entirely broken, which is what
+        # makes a short assertion window alone unable to prove delivery. At
+        # 300s, only the notification can close it in time.
+        node_a = processes.start_wg(
+            env={"WARPGATE_ACCESS_WATCH_INTERVAL_SECS": "300"}
+        )
         wait_port(node_a.http_port, recv=False)
         node_b = processes.start_wg(share_with=node_a)
         wait_port(node_b.http_port, recv=False)
@@ -128,12 +137,11 @@ class Test:
         with admin_client(url_b) as api:
             api.delete_ticket(ticket.ticket.id)
 
-        # A tight deadline, well under the watcher's own (5s) poll interval:
-        # without the cluster notification actually reaching node A, this
-        # would only close on node A's own next periodic poll, which this
-        # window is too short to wait out — so a pass here is what proves the
-        # notification (not just eventual local polling) did the work.
-        assert ssh_client.wait(timeout=3) is not None, (
+        # Node A's own poll is 300s away; without the cluster notification
+        # actually reaching it, nothing on node A would close this session
+        # within this window. A pass here is what proves the notification
+        # (not eventual local polling) did the work.
+        assert ssh_client.wait(timeout=10) is not None, (
             "session was not closed via the cross-node ticket-revocation notification"
         )
 
