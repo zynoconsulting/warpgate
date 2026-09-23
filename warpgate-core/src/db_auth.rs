@@ -1,10 +1,20 @@
 //! The authorization flow shared by the database protocols (MySQL, PostgreSQL).
 //!
-//! Both speak the same sequence — IP block, user lockout, credential policy,
-//! brute-force accounting, target authorization — and differ only in how they
-//! word a handful of messages. That difference is [`DbAuthTransport`];
-//! everything else is [`run_db_authorization`], so the two protocols cannot
-//! drift apart on any of the security-relevant steps.
+//! Both speak the same sequence: IP block, user lockout, full credential
+//! policy acceptance (password, and whatever further factor the policy
+//! demands) into an [`AuthorizedIdentity`], role-based target authorization,
+//! then — only when no role grants the target — an activated self-service
+//! ticket for that same user and target, admin approval, and admission. A
+//! ticket only ever supplies the target grant on top of an identity that
+//! already cleared every other check; it never bypasses a password, MFA, web
+//! approval, an IP restriction or a lockout. `ticket-<secret>` authentication
+//! ([`AuthSelector::Ticket`]) is a separate selector entirely and is
+//! unaffected by any of this.
+//!
+//! The two protocols differ only in how they word a handful of messages.
+//! That difference is [`DbAuthTransport`]; everything else is
+//! [`run_db_authorization`], so the two protocols cannot drift apart on any
+//! of the security-relevant steps.
 
 use std::net::IpAddr;
 
@@ -19,8 +29,9 @@ use crate::approvals::{GateOutcome, GatedConnection};
 use crate::auth::submit_credential;
 use crate::login_protection::FailedAttemptInfo;
 use crate::{
-    ApprovedTarget, AuthorizedIdentity, Services, TargetAuthorization, authorize_and_spend_ticket,
-    authorize_for_target_by_name, wait_for_auth_completion,
+    ApprovedTarget, AuthorizedIdentity, ConfigProvider, Services, TargetAuthorization,
+    authorize_active_self_service_ticket, authorize_and_spend_ticket, authorize_for_target,
+    wait_for_auth_completion,
 };
 
 /// Proof that the success message has not been sent yet. Exactly one is minted
@@ -239,15 +250,15 @@ async fn authorize_user<T: DbAuthTransport>(
                     return Ok(None);
                 };
 
-                let Some(authorization) = authorize_for_target_by_name(
-                    services.config_provider.as_ref(),
-                    &identity,
-                    target_name,
-                )
-                .await?
+                let Some(authorization) =
+                    authorize_for_target_or_ticket(services, &identity, target_name).await?
                 else {
                     warn!("Target {target_name} not authorized for user {username}");
-                    record_password_failure(services, username, remote_ip, T::PROTOCOL).await;
+                    // Not a failed login: the credentials were correct. Counting
+                    // it would lock out a user whose client keeps retrying after
+                    // their ticket lapsed — including out of the web UI they'd
+                    // request a new ticket from. The client sees the same denial
+                    // either way.
                     transport.send_denied().await?;
                     return Ok(None);
                 };
@@ -376,6 +387,57 @@ async fn authorize_user<T: DbAuthTransport>(
     }
 }
 
+/// Authorizes an already-fully-authenticated `identity` for `target_name`: a
+/// role first (regardless of the target's own protocol -- same as the
+/// pre-JIT behaviour this replaces, and still narrowed against `identity`'s
+/// protocol by the caller's own [`ApprovedTarget::narrow`] afterwards), or
+/// -- only when no role grants it -- an activated self-service ticket for
+/// that same user and target, gated on the target actually speaking
+/// `identity`'s protocol. A missing target, a role-less user with no
+/// eligible ticket, and a role-less user whose target is of some other
+/// protocol are all the same `None` here, so the caller's denial can't
+/// distinguish them from each other.
+///
+/// The ticket supplies only the target grant on top of `identity`: it is
+/// never itself a substitute for the credential policy that produced
+/// `identity` in [`authorize_user`].
+async fn authorize_for_target_or_ticket(
+    services: &Services,
+    identity: &AuthorizedIdentity,
+    target_name: &str,
+) -> Result<Option<TargetAuthorization>, WarpgateError> {
+    let Some(target) = services
+        .config_provider
+        .get_target_by_name(target_name)
+        .await?
+    else {
+        return Ok(None);
+    };
+
+    if let Some(authorization) =
+        authorize_for_target(services.config_provider.as_ref(), identity, target.clone()).await?
+    {
+        return Ok(Some(authorization));
+    }
+
+    if target.options.protocol() != identity.protocol() {
+        return Ok(None);
+    }
+
+    let Some(authorization) =
+        authorize_active_self_service_ticket(&services.db, identity.clone(), target).await?
+    else {
+        return Ok(None);
+    };
+
+    info!(
+        target = %target_name,
+        username = %identity.user_info().username,
+        "Authorized target access with an activated self-service ticket"
+    );
+    Ok(Some(authorization))
+}
+
 async fn record_password_failure(
     services: &Services,
     username: &str,
@@ -391,4 +453,229 @@ async fn record_password_failure(
             credential_type: "password".to_owned(),
         })
         .await;
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod tests {
+    use sea_orm::ActiveValue::Set;
+    use sea_orm::{ActiveModelTrait, Database, DatabaseConnection, EntityTrait};
+    use time::OffsetDateTime;
+    use uuid::Uuid;
+    use warpgate_common::auth::AuthStateUserInfo;
+    use warpgate_common::helpers::hash::hash_secret;
+    use warpgate_common::{DatabaseTargetAuth, Target, TargetOptions, TargetPostgresOptions, Tls};
+    use warpgate_db_entities as e;
+    use warpgate_db_entities::Parameters::{ConfigMigrationValues, set_config_migration_values};
+
+    use super::*;
+    use crate::approvals::tests::delivery::test_services;
+
+    fn postgres_target() -> Target {
+        Target {
+            id: Uuid::new_v4(),
+            name: "pg".into(),
+            description: String::new(),
+            allow_roles: vec![],
+            options: TargetOptions::Postgres(TargetPostgresOptions {
+                host: "localhost".into(),
+                port: 5432,
+                username: "postgres".into(),
+                auth: DatabaseTargetAuth::default(),
+                tls: Tls::default(),
+                idle_timeout: None,
+                default_database_name: None,
+                protocol_version: Default::default(),
+            }),
+            rate_limit_bytes_per_second: None,
+            group_id: None,
+            ticket_max_duration_seconds: None,
+            ticket_requests_disabled: false,
+            ticket_require_approval: false,
+            require_approval: false,
+            ticket_max_uses: None,
+        }
+    }
+
+    /// A migrated database with `services` wired to it, one user and one
+    /// Postgres target, so every test here differs only in the role/ticket
+    /// rows it adds on top.
+    async fn db_fixture() -> (DatabaseConnection, Services, Target, Uuid) {
+        set_config_migration_values(ConfigMigrationValues::default());
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        warpgate_db_migrations::migrate_database(&db).await.unwrap();
+        let services = test_services(&db).await;
+
+        let user_id = Uuid::new_v4();
+        e::User::ActiveModel {
+            id: Set(user_id),
+            username: Set("alice".into()),
+            description: Set(String::new()),
+            credential_policy: Set(serde_json::json!({})),
+            rate_limit_bytes_per_second: Set(None),
+            ldap_server_id: Set(None),
+            ldap_object_uuid: Set(None),
+            allowed_ip_ranges: Set(serde_json::Value::Null),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        let target = postgres_target();
+        e::Target::ActiveModel {
+            id: Set(target.id),
+            name: Set(target.name.clone()),
+            description: Set(String::new()),
+            kind: Set(e::Target::TargetKind::Postgres),
+            options: Set(serde_json::to_value(&target.options).unwrap()),
+            rate_limit_bytes_per_second: Set(None),
+            group_id: Set(None),
+            ticket_max_duration_seconds: Set(None),
+            ticket_requests_disabled: Set(false),
+            ticket_require_approval: Set(false),
+            ticket_max_uses: Set(None),
+            require_approval: Set(false),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        (db, services, target, user_id)
+    }
+
+    /// Grants `user_id` a role authorizing `target_id`, through a fresh role
+    /// created just for this assignment.
+    async fn grant_role(db: &DatabaseConnection, user_id: Uuid, target_id: Uuid) {
+        let role_id = Uuid::new_v4();
+        e::Role::ActiveModel {
+            id: Set(role_id),
+            name: Set(format!("role-{role_id}")),
+            description: Set(String::new()),
+            is_default: Set(false),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        e::UserRoleAssignment::ActiveModel {
+            user_id: Set(user_id),
+            role_id: Set(role_id),
+            granted_at: Set(None),
+            expires_at: Set(None),
+            revoked_at: Set(None),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        e::TargetRoleAssignment::ActiveModel {
+            target_id: Set(target_id),
+            role_id: Set(role_id),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    /// Inserts a self-service ticket for `user_id`/`target_id` with one use
+    /// left, returning its id.
+    async fn insert_self_service_ticket(
+        db: &DatabaseConnection,
+        user_id: Uuid,
+        target_id: Uuid,
+    ) -> Uuid {
+        let ticket_id = Uuid::new_v4();
+        e::Ticket::ActiveModel {
+            id: Set(ticket_id),
+            secret_hash: Set(hash_secret(&format!("t1cket-{ticket_id}"))),
+            user_id: Set(user_id),
+            description: Set(String::new()),
+            target_id: Set(target_id),
+            uses_left: Set(Some(1)),
+            self_service: Set(true),
+            expiry: Set(None),
+            created: Set(OffsetDateTime::now_utc()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        ticket_id
+    }
+
+    fn identity_for(user_id: Uuid, protocol: Protocol) -> AuthorizedIdentity {
+        AuthorizedIdentity::for_authenticated_session(
+            AuthStateUserInfo {
+                id: user_id,
+                username: "alice".into(),
+            },
+            protocol,
+        )
+    }
+
+    async fn uses_left(db: &DatabaseConnection, ticket_id: Uuid) -> Option<i16> {
+        e::Ticket::Entity::find_by_id(ticket_id)
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap()
+            .uses_left
+    }
+
+    /// A role grants access outright and leaves an otherwise-eligible ticket
+    /// completely untouched -- role wins, no ticket spent, no attribution.
+    #[tokio::test]
+    async fn role_wins_with_no_spend() {
+        let (db, services, target, user_id) = db_fixture().await;
+        grant_role(&db, user_id, target.id).await;
+        let ticket_id = insert_self_service_ticket(&db, user_id, target.id).await;
+
+        let identity = identity_for(user_id, Protocol::Postgres);
+        let authorization = authorize_for_target_or_ticket(&services, &identity, &target.name)
+            .await
+            .unwrap()
+            .expect("the role should authorize");
+        assert_eq!(authorization.ticket_id(), None);
+        assert_eq!(uses_left(&db, ticket_id).await, Some(1));
+    }
+
+    /// With no role, an activated self-service ticket for the same user and
+    /// target grants access and is attributed on the authorization.
+    #[tokio::test]
+    async fn ticket_grants_when_no_role() {
+        let (db, services, target, user_id) = db_fixture().await;
+        let ticket_id = insert_self_service_ticket(&db, user_id, target.id).await;
+
+        let identity = identity_for(user_id, Protocol::Postgres);
+        let authorization = authorize_for_target_or_ticket(&services, &identity, &target.name)
+            .await
+            .unwrap()
+            .expect("the ticket should authorize");
+        assert_eq!(authorization.ticket_id(), Some(ticket_id));
+        assert_eq!(uses_left(&db, ticket_id).await, Some(0));
+    }
+
+    /// An identity authenticated under a different protocol than the target
+    /// actually is must be denied without ever spending the ticket -- a
+    /// ticket never authorizes access to a target of another protocol.
+    #[tokio::test]
+    async fn protocol_mismatch_denies_without_spending() {
+        let (db, services, target, user_id) = db_fixture().await;
+        let ticket_id = insert_self_service_ticket(&db, user_id, target.id).await;
+
+        let identity = identity_for(user_id, Protocol::MySql);
+        let authorization = authorize_for_target_or_ticket(&services, &identity, &target.name)
+            .await
+            .unwrap();
+        assert!(authorization.is_none());
+        assert_eq!(uses_left(&db, ticket_id).await, Some(1));
+    }
+
+    /// A target that doesn't exist denies the same way a role-less,
+    /// ticket-less user would -- the caller can't tell the two apart.
+    #[tokio::test]
+    async fn missing_target_denies() {
+        let (_db, services, _target, user_id) = db_fixture().await;
+        let identity = identity_for(user_id, Protocol::Postgres);
+        let authorization = authorize_for_target_or_ticket(&services, &identity, "no-such-target")
+            .await
+            .unwrap();
+        assert!(authorization.is_none());
+    }
 }
