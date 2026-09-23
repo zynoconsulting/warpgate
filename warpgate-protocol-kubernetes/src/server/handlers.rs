@@ -20,9 +20,9 @@ use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::logging::{
     get_client_ip, log_request_error, log_request_result, span_for_request,
 };
-use warpgate_core::Services;
 use warpgate_core::logging::KubernetesAuditSubject;
 use warpgate_core::recordings::{TerminalRecorder, TerminalRecordingStreamId};
+use warpgate_core::{Services, WarpgateServerHandle};
 
 use crate::audit::{StreamOperation, classify_mutating, classify_stream};
 use crate::correlator::{AdmittedSession, RequestCorrelator, correlated_authorization};
@@ -179,6 +179,7 @@ pub async fn handle_api_request(
                 &audit_subject,
                 ctx.services(),
                 closed.clone(),
+                handle.clone(),
             )
             .await
             .map(IntoResponse::into_response)
@@ -195,6 +196,7 @@ pub async fn handle_api_request(
                 &audit_subject,
                 ctx.services(),
                 closed,
+                handle.clone(),
             )
             .await
             .map(IntoResponse::into_response)
@@ -242,6 +244,7 @@ async fn _handle_normal_request_inner(
     audit_subject: &KubernetesAuditSubject,
     services: &Services,
     closed: CancellationToken,
+    handle: Arc<Mutex<WarpgateServerHandle>>,
 ) -> Result<Response, WarpgateError> {
     let user_info = admitted.user_info();
     let k8s_options = admitted.options();
@@ -413,18 +416,39 @@ async fn _handle_normal_request_inner(
             .any(|(k, v)| (k == "watch" || k == "follow") && v == "true");
 
         if transfer_encoding == "chunked" || is_streaming_response {
-            (
-                Body::from_bytes_stream(
-                    response
-                        .bytes_stream()
-                        .map_err(std::io::Error::other)
-                        // A `kubectl logs -f`/`watch=true` stream can run for as
-                        // long as the ticket that opened it; end it here rather
-                        // than only on the session's next request.
-                        .take_until(closed.clone().cancelled_owned()),
-                ),
-                None,
-            )
+            // A `kubectl logs -f`/`watch=true` stream can run for as long as
+            // the ticket that opened it, well past `session_max_age` ageing
+            // the correlator's own entry out of its cache. Carrying `handle`
+            // in the stream's state (rather than just racing `closed`) keeps
+            // the session — and its access watcher — alive for as long as
+            // this stream is actually read, so a still-open `logs -f` can't
+            // outlive the thing revoking it just because the cache forgot it.
+            let upstream = response.bytes_stream().map_err(std::io::Error::other);
+            let stream = futures::stream::unfold(
+                (upstream, closed.clone(), handle.clone(), false),
+                |(mut upstream, closed, handle, done)| async move {
+                    if done {
+                        return None;
+                    }
+                    tokio::select! {
+                        biased;
+                        // A clean EOF would read to `kubectl` as the stream
+                        // having ended normally (exit 0); an error instead
+                        // surfaces the close as the abrupt cutoff it is.
+                        () = closed.cancelled() => Some((
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionAborted,
+                                "session closed",
+                            )),
+                            (upstream, closed, handle, true),
+                        )),
+                        item = upstream.next() => {
+                            item.map(|item| (item, (upstream, closed, handle, false)))
+                        }
+                    }
+                },
+            );
+            (Body::from_bytes_stream(stream), None)
         } else {
             let bytes = tokio::select! {
                 biased;
@@ -519,6 +543,7 @@ async fn _handle_websocket_request_inner(
     audit_subject: &KubernetesAuditSubject,
     services: &Services,
     closed: CancellationToken,
+    handle: Arc<Mutex<WarpgateServerHandle>>,
 ) -> anyhow::Result<impl IntoResponse> {
     let user_info = admitted.user_info();
     let k8s_options = admitted.options();
@@ -567,6 +592,13 @@ async fn _handle_websocket_request_inner(
     let audit_subject = audit_subject.clone();
 
     let ws_handler_inner = async move |socket: WebSocketStream| {
+        // Held for the life of the pump below, not just the request that
+        // upgraded it: `session_max_age` can age this session's entry out of
+        // the correlator's cache while the socket is still open, and without
+        // a strong reference here that would drop the last
+        // `WarpgateServerHandle`, tearing the session (and its access
+        // watcher) down out from under a websocket that is still in use.
+        let _session_handle = handle;
         let client_response = tokio::select! {
             biased;
             () = closed.cancelled() => bail!("Session closed while upgrading the Kubernetes websocket"),
