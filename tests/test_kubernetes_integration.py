@@ -1738,6 +1738,16 @@ class TestKubernetesIntegration:
                 assert denied_after_revocation.status_code == 403, (
                     denied_after_revocation.text
                 )
+
+                # The failed re-check evicted the correlated session, so a new
+                # ticket takes effect on the very next request rather than
+                # after the stale session ages out.
+                with admin_client(url) as api:
+                    _activate_self_service_ticket(api, session, url, target_name)
+                allowed_again = requests.get(
+                    endpoint, headers=headers, verify=False, timeout=15
+                )
+                assert allowed_again.status_code == 200, allowed_again.text
         finally:
             with admin_client(url) as api:
                 _disable_self_service(api)
