@@ -247,9 +247,12 @@ class ProcessManager:
                 f"MINIO_ROOT_USER={user}",
                 "-e",
                 f"MINIO_ROOT_PASSWORD={password}",
-                "quay.io/minio/minio",
+                # MinIO no longer publishes public images (quay.io and Docker
+                # Hub pulls now fail); Chainguard's build is maintained. It
+                # runs as nonroot, so keep the data dir somewhere writable.
+                "cgr.dev/chainguard/minio:latest",
                 "server",
-                "/data",
+                "/tmp/data",
             ]
         )
         return port
