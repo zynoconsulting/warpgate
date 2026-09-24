@@ -27,7 +27,7 @@ use warpgate_common::auth::{
 use warpgate_common::eventhub::{EventHub, EventSender};
 use warpgate_common::helpers::username::username_eq_ci;
 use warpgate_common::{
-    Secret, TargetOptions, TargetSSHOptions, TargetSessionId, UserSessionId, WarpgateError,
+    Secret, Target, TargetOptions, TargetSSHOptions, TargetSessionId, UserSessionId, WarpgateError,
 };
 use warpgate_common_http::ext::construct_external_url;
 use warpgate_core::approvals::{GateOutcome, GatedConnection};
@@ -36,8 +36,8 @@ use warpgate_core::login_protection::FailedAttemptInfo;
 use warpgate_core::recordings::{self, TerminalRecorder, TrafficConnectionParams, TrafficRecorder};
 use warpgate_core::{
     AdmittedTarget, ApprovedTarget, AuthorizedIdentity, ConfigProvider, Services,
-    TargetAuthorization, TargetSessionStart, WarpgateServerHandle, authorize_and_spend_ticket,
-    authorize_for_target, authorize_for_target_by_name,
+    TargetAuthorization, TargetSessionStart, WarpgateServerHandle,
+    authorize_active_self_service_ticket, authorize_and_spend_ticket, authorize_for_target,
 };
 use warpgate_db_entities::Parameters;
 use warpgate_db_entities::Parameters::SshHostKeyVerificationMode;
@@ -120,6 +120,29 @@ struct CachedSuccessfulTicketAuth {
     user_info: AuthStateUserInfo,
 }
 
+/// A self-service ticket grant already resolved for this connection's
+/// `user:target` pair, so a bounded ticket's use is spent at most once per
+/// connection.
+///
+/// `try_auth_eager`'s `AuthResult::Accepted` branch is not a one-shot: the
+/// backing `AuthState` is cached per (username, target) on the session (see
+/// [`ServerSession::get_auth_state`]) and re-verified on every call, so an
+/// offer-phase probe, a retried auth method, or a client that pipelines an
+/// extra auth request after success can all re-enter it once it has already
+/// gone `Accepted`. Each re-entry would otherwise call
+/// [`authorize_active_self_service_ticket`] again and spend another use.
+struct CachedActiveTicketGrant {
+    username: String,
+    target_name: String,
+    ticket_id: Uuid,
+}
+
+impl CachedActiveTicketGrant {
+    fn matches(&self, username: &str, target_name: &str) -> bool {
+        username_eq_ci(&self.username, username) && self.target_name == target_name
+    }
+}
+
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub enum TrafficRecorderKey {
     Tcp(String, u32),
@@ -175,6 +198,7 @@ pub struct ServerSession {
     disconnect_token: CancellationToken,
     keyboard_interactive_state: Option<PendingKeyboardInteractiveAuth>,
     cached_successful_ticket_auth: Option<CachedSuccessfulTicketAuth>,
+    cached_active_ticket_grant: Option<CachedActiveTicketGrant>,
     allowed_auth_methods: MethodSet,
     /// Track the state of a client snooping around pre-auth
     probe: ProbeState,
@@ -221,8 +245,9 @@ fn reject_with_allowed_auth_methods(allowed_auth_methods: MethodSet) -> russh::s
 #[cfg(test)]
 mod tests {
     use russh::{MethodKind, MethodSet};
+    use uuid::Uuid;
 
-    use super::reject_with_allowed_auth_methods;
+    use super::{CachedActiveTicketGrant, reject_with_allowed_auth_methods};
 
     #[test]
     fn rejected_public_key_auth_advertises_only_configured_methods() {
@@ -240,6 +265,28 @@ mod tests {
         assert_eq!(advertised_methods, configured_methods);
         assert!(!advertised_methods.contains(&MethodKind::Password));
         assert!(!advertised_methods.contains(&MethodKind::KeyboardInteractive));
+    }
+
+    /// The cached ticket grant must only be reused for the exact
+    /// (username, target) pair it was resolved for -- reusing it for a
+    /// different target, or a different user re-using the connection's
+    /// cache, would hand out access a bounded ticket's use never actually
+    /// paid for.
+    #[test]
+    fn cached_active_ticket_grant_matches_same_user_and_target_only() {
+        let cached = CachedActiveTicketGrant {
+            username: "Alice".into(),
+            target_name: "web1".into(),
+            ticket_id: Uuid::new_v4(),
+        };
+
+        // Username comparison is case-insensitive, like the rest of the auth
+        // state caching in this file (see `get_auth_state`).
+        assert!(cached.matches("alice", "web1"));
+        assert!(cached.matches("ALICE", "web1"));
+
+        assert!(!cached.matches("alice", "web2"));
+        assert!(!cached.matches("bob", "web1"));
     }
 }
 
@@ -300,6 +347,7 @@ impl ServerSession {
             disconnect_token: CancellationToken::new(),
             keyboard_interactive_state: None,
             cached_successful_ticket_auth: None,
+            cached_active_ticket_grant: None,
             allowed_auth_methods: get_allowed_auth_methods(services).await?,
             probe: ProbeState::NoAttempt,
             client_socket: Some(client_socket),
@@ -2466,13 +2514,40 @@ impl ServerSession {
                         let authorization = if target_name.is_empty() {
                             None
                         } else {
-                            let Some(authorization) = authorize_for_target_by_name(
-                                self.services.config_provider.as_ref(),
-                                &identity,
-                                target_name,
-                            )
-                            .await?
-                            else {
+                            let target = self
+                                .services
+                                .config_provider
+                                .get_target_by_name(target_name)
+                                .await?;
+                            let authorization = match target {
+                                None => None,
+                                Some(target) => match authorize_for_target(
+                                    self.services.config_provider.as_ref(),
+                                    &identity,
+                                    target.clone(),
+                                )
+                                .await?
+                                {
+                                    Some(authorization) => Some(authorization),
+                                    // No role grants it — fall back to an activated
+                                    // self-service ticket for the same user and
+                                    // target, gated on the target speaking this
+                                    // identity's protocol just like the role check
+                                    // implicitly is (`identity` was authenticated
+                                    // for SSH, so only an SSH target may be granted
+                                    // this way).
+                                    None if target.options.protocol() == identity.protocol() => {
+                                        self.authorize_via_active_ticket(
+                                            &identity,
+                                            target,
+                                            target_name,
+                                        )
+                                        .await?
+                                    }
+                                    None => None,
+                                },
+                            };
+                            let Some(authorization) = authorization else {
                                 warn!(
                                     "Target {} not authorized for user {}",
                                     target_name, username
@@ -2482,8 +2557,21 @@ impl ServerSession {
                             Some(authorization)
                         };
                         self.authorized_identity = Some(identity);
-                        self._auth_accept(user_info.clone(), authorization).await?;
-                        Ok(AuthResult::Accepted { user_info })
+                        // A self-service ticket backing `authorization` could be
+                        // revoked or expire in the gap between granting it above
+                        // and admission here; that is an ordinary auth rejection,
+                        // not a session error (mirrors the ticket-secret path
+                        // below).
+                        match self._auth_accept(user_info.clone(), authorization).await {
+                            Ok(()) => Ok(AuthResult::Accepted { user_info }),
+                            Err(WarpgateError::TargetAccessRevoked) => {
+                                warn!(
+                                    "Ticket was revoked or expired before the session could start"
+                                );
+                                Ok(AuthResult::Rejected)
+                            }
+                            Err(error) => Err(error.into()),
+                        }
                     }
                     x => Ok(x),
                 }
@@ -2513,7 +2601,9 @@ impl ServerSession {
                         {
                             Ok(()) => Ok(AuthResult::Accepted { user_info }),
                             Err(WarpgateError::TargetAccessRevoked) => {
-                                warn!("Ticket was revoked or expired before the session could start");
+                                warn!(
+                                    "Ticket was revoked or expired before the session could start"
+                                );
                                 Ok(AuthResult::Rejected)
                             }
                             Err(error) => Err(error.into()),
@@ -2523,6 +2613,54 @@ impl ServerSession {
                 }
             }
         }
+    }
+
+    /// Authorizes `identity` for `target` through an activated self-service
+    /// ticket for the same user and target, reusing a grant already resolved
+    /// earlier on this connection instead of spending a bounded ticket's use
+    /// again — see [`CachedActiveTicketGrant`] for why that repeat is real,
+    /// not hypothetical.
+    async fn authorize_via_active_ticket(
+        &mut self,
+        identity: &AuthorizedIdentity,
+        target: Target,
+        target_name: &str,
+    ) -> Result<Option<TargetAuthorization>, WarpgateError> {
+        let username = &identity.user_info().username;
+
+        if let Some(cached) = &self.cached_active_ticket_grant
+            && cached.matches(username, target_name)
+        {
+            return Ok(Some(TargetAuthorization::for_ticket_session(
+                identity.user_info().clone(),
+                target,
+                cached.ticket_id,
+                identity.protocol(),
+            )?));
+        }
+
+        let Some(authorization) =
+            authorize_active_self_service_ticket(&self.services.db, identity.clone(), target)
+                .await?
+        else {
+            return Ok(None);
+        };
+
+        if let Some(ticket_id) = authorization.ticket_id() {
+            self.cached_active_ticket_grant = Some(CachedActiveTicketGrant {
+                username: username.clone(),
+                target_name: target_name.to_owned(),
+                ticket_id,
+            });
+        }
+
+        info!(
+            target = %target_name,
+            username = %username,
+            "Authorized target access with an activated self-service ticket"
+        );
+
+        Ok(Some(authorization))
     }
 
     async fn _auth_accept(
