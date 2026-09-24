@@ -350,7 +350,14 @@ async fn await_kubernetes_web_approval(
                 return AuthorizedIdentity::from_auth_state(&*state_arc.lock().await)
                     .ok_or_else(unauthorized);
             }
-            AuthResult::Need(kinds) if kinds.contains(&CredentialKind::WebUserApproval) => {
+            // Wait only when web approval is all that's left: if the policy
+            // still needs another factor (e.g. `Sso` from a non-OIDC client),
+            // approving can't satisfy it and the client would hang until the
+            // approval timed out.
+            AuthResult::Need(kinds)
+                if !kinds.is_empty()
+                    && kinds.iter().all(|kind| *kind == CredentialKind::WebUserApproval) =>
+            {
                 if services.try_web_approval_bypass(state_arc).await? {
                     continue;
                 }
