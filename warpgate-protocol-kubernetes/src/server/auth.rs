@@ -15,7 +15,8 @@ use warpgate_common::auth::{
     AuthCredential, AuthResult, AuthState, AuthStateUserInfo, CredentialKind,
 };
 use warpgate_common::{
-    Protocol, Secret, TargetKubernetesOptions, User, UserSessionId, WarpgateError,
+    Protocol, Secret, TargetKubernetesOptions, User, UserRequireCredentialsPolicy, UserSessionId,
+    WarpgateError,
 };
 use warpgate_common_http::authorization_token;
 use warpgate_common_http::logging::get_client_ip_addr;
@@ -68,6 +69,17 @@ pub fn unauthorized() -> poem::Error {
         "Unauthorized: provide a valid Bearer token or client certificate",
         poem::http::StatusCode::UNAUTHORIZED,
     )
+}
+
+/// True if the given protocol slot of `policy` (selected by `pick`, e.g.
+/// `|p| p.kubernetes.as_ref()`) is an explicit, non-empty list of required
+/// credential kinds. `None` (no policy, or no entry for this protocol) and an
+/// explicit empty list both mean "no requirement" and return `false`.
+fn policy_requires_credentials(
+    policy: Option<&UserRequireCredentialsPolicy>,
+    pick: impl Fn(&UserRequireCredentialsPolicy) -> Option<&Vec<CredentialKind>>,
+) -> bool {
+    policy.and_then(pick).is_some_and(|kinds| !kinds.is_empty())
 }
 
 /// What kind of credential the client presented, for audit and rate-limiting.
@@ -126,15 +138,37 @@ pub async fn authenticate_kubernetes_user(
 
     let ticket_secret = authorization_token(req, "Bearer").and_then(|v| v.strip_prefix("ticket-"));
     let identity = if let Some(secret) = ticket_secret {
-        validate_ticket(
+        let validated = validate_ticket(
             &services.db,
             &services.login_protection,
             &Secret::new(secret.to_owned()),
             client_ip,
             crate::PROTOCOL_NAME,
         )
-        .await?
-        .map(KubernetesIdentity::Ticket)
+        .await?;
+        match validated {
+            Some(ticket) => {
+                // The ticket secret itself is the credential here (`Bearer
+                // ticket-<secret>`), and it cannot satisfy any `CredentialKind`
+                // factor. A user with an explicit, non-empty Kubernetes
+                // credential policy therefore can never clear it this way, no
+                // matter how the ticket was granted — so this is checked, and
+                // refused, before the ticket is ever spent (spending happens
+                // later, once a session is being established).
+                let ticket_user = user_for_username(services, &ticket.user_info().username).await?;
+                if policy_requires_credentials(ticket_user.credential_policy.as_ref(), |p| {
+                    p.kubernetes.as_ref()
+                }) {
+                    warn!(
+                        username = %ticket_user.username,
+                        "Refusing ticket-secret Kubernetes auth: user's credential policy requires credentials a ticket secret cannot provide"
+                    );
+                    return Err(unauthorized());
+                }
+                Some(KubernetesIdentity::Ticket(ticket))
+            }
+            None => None,
+        }
     } else {
         authenticate(req, services)
             .await?
@@ -277,11 +311,8 @@ async fn authorize_kubernetes_identity(
     target_name: &str,
     session_id: UserSessionId,
 ) -> poem::Result<AuthorizedIdentity> {
-    let policy_configured = user
-        .credential_policy
-        .as_ref()
-        .and_then(|p| p.kubernetes.as_ref())
-        .is_some_and(|kinds| !kinds.is_empty());
+    let policy_configured =
+        policy_requires_credentials(user.credential_policy.as_ref(), |p| p.kubernetes.as_ref());
 
     if !policy_configured {
         let parameters = Parameters::Entity::get(&services.db)
@@ -721,4 +752,48 @@ fn normalize_certificate_pem(pem: &str) -> String {
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect()
+}
+
+#[cfg(test)]
+mod policy_requires_credentials_tests {
+    use warpgate_common::UserRequireCredentialsPolicy;
+    use warpgate_common::auth::CredentialKind;
+
+    use super::policy_requires_credentials;
+
+    fn kubernetes(p: &UserRequireCredentialsPolicy) -> Option<&Vec<CredentialKind>> {
+        p.kubernetes.as_ref()
+    }
+
+    #[test]
+    fn no_policy_means_no_requirement() {
+        assert!(!policy_requires_credentials(None, kubernetes));
+    }
+
+    #[test]
+    fn policy_with_no_entry_for_protocol_means_no_requirement() {
+        let policy = UserRequireCredentialsPolicy {
+            ssh: Some(vec![CredentialKind::Password]),
+            ..Default::default()
+        };
+        assert!(!policy_requires_credentials(Some(&policy), kubernetes));
+    }
+
+    #[test]
+    fn explicit_empty_list_means_no_requirement() {
+        let policy = UserRequireCredentialsPolicy {
+            kubernetes: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(!policy_requires_credentials(Some(&policy), kubernetes));
+    }
+
+    #[test]
+    fn non_empty_list_means_requirement() {
+        let policy = UserRequireCredentialsPolicy {
+            kubernetes: Some(vec![CredentialKind::Sso]),
+            ..Default::default()
+        };
+        assert!(policy_requires_credentials(Some(&policy), kubernetes));
+    }
 }

@@ -104,6 +104,27 @@ def test_ticket_revocation_applies_to_cached_session(shared_wg, ticket_setup):
     assert request(shared_wg, ticket.secret).status_code == 401
 
 
+def test_ticket_secret_refused_when_user_has_kubernetes_credential_policy(shared_wg, ticket_setup):
+    """The ticket secret (`Bearer ticket-<secret>`) is itself the credential
+    here, and it cannot satisfy any `CredentialKind` factor. A user with an
+    explicit, non-empty Kubernetes credential policy must therefore be
+    refused ticket-secret auth outright — before the ticket is ever spent —
+    regardless of how many uses the ticket has left."""
+    api, user, target = ticket_setup
+    api.update_user(
+        user.id,
+        sdk.UserDataRequest(
+            username=user.username,
+            credential_policy=sdk.UserRequireCredentialsPolicy(
+                kubernetes=[sdk.CredentialKind.WEBUSERAPPROVAL],
+            ),
+        ),
+    )
+    ticket = create_ticket(ticket_setup, number_of_uses=1)
+    assert request(shared_wg, ticket.secret).status_code == 401
+    assert uses_left(ticket_setup, ticket) == 1
+
+
 def test_kubectl_with_targetless_ticket_kubeconfig(shared_wg, ticket_setup, tmp_path):
     ticket = create_ticket(ticket_setup, number_of_uses=1)
     config = tmp_path / "warpgate-kubeconfig.yaml"
