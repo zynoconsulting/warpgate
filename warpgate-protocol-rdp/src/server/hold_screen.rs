@@ -345,7 +345,11 @@ mod hold_while_tests {
     ///
     /// The hold here never resolves, which is the case that matters: the drain
     /// has to happen *during* the wait, not after it.
-    #[tokio::test]
+    ///
+    /// Runs on a paused clock: virtual time only advances while the runtime is
+    /// idle, so the 200ms window can't be eaten by slow frame painting on a
+    /// loaded CI runner before the queued events are drained.
+    #[tokio::test(start_paused = true)]
     async fn viewer_input_does_not_pile_up_behind_the_hold() {
         let (tx, mut events) = unbounded_channel();
         let mut screen = screen();
