@@ -155,7 +155,17 @@ pub async fn authenticate_kubernetes_user(
                 // matter how the ticket was granted — so this is checked, and
                 // refused, before the ticket is ever spent (spending happens
                 // later, once a session is being established).
-                let ticket_user = user_for_username(services, &ticket.user_info().username).await?;
+                // Looked up by id, and a missing user fails closed.
+                let Some(ticket_user) =
+                    warpgate_db_entities::User::Entity::find_by_id(ticket.user_info().id)
+                        .one(&services.db)
+                        .await
+                        .map_err(WarpgateError::from)?
+                        .map(User::try_from)
+                        .transpose()?
+                else {
+                    return Err(unauthorized());
+                };
                 if policy_requires_credentials(ticket_user.credential_policy.as_ref(), |p| {
                     p.kubernetes.as_ref()
                 }) {
