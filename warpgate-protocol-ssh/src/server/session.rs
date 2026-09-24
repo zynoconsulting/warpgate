@@ -13,6 +13,7 @@ use futures::{Future, FutureExt};
 use russh::keys::{PublicKey, PublicKeyBase64};
 use russh::server::ChannelOpenHandle;
 use russh::{ChannelId, ChannelOpenFailure, MethodKind, MethodSet, Sig};
+use sea_orm::EntityTrait;
 use termcolor::Color;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex, broadcast, oneshot};
@@ -2657,18 +2658,21 @@ impl ServerSession {
                         // refuse the ticket-secret login outright rather than
                         // spending the ticket's use on an attempt that could
                         // never have been genuinely authorized.
-                        let ticket_user: Option<User> = self
-                            .services
-                            .config_provider
-                            .list_users()
-                            .await?
-                            .into_iter()
-                            .find(|u| username_eq_ci(&u.username, &user_info.username));
-                        if ssh_policy_requires_credentials(
-                            ticket_user
-                                .as_ref()
-                                .and_then(|u| u.credential_policy.as_ref()),
-                        ) {
+                        // Looked up by id, and a missing user fails closed.
+                        let ticket_user = warpgate_db_entities::User::Entity::find_by_id(
+                            user_info.id,
+                        )
+                        .one(&self.services.db)
+                        .await
+                        .map_err(WarpgateError::from)?
+                        .map(User::try_from)
+                        .transpose()?;
+                        let Some(ticket_user) = ticket_user else {
+                            warn!(username = %user_info.username, "Ticket user no longer exists");
+                            return Ok(AuthResult::Rejected);
+                        };
+                        if ssh_policy_requires_credentials(ticket_user.credential_policy.as_ref())
+                        {
                             warn!(
                                 username = %user_info.username,
                                 "Ticket-secret SSH login rejected: user's credential policy \
