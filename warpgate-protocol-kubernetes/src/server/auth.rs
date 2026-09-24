@@ -11,12 +11,15 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 use warpgate_aws::EksClusterInfo;
 use warpgate_ca::{deserialize_certificate, serialize_certificate_serial};
-use warpgate_common::auth::{AuthResult, AuthState, AuthStateUserInfo, CredentialKind};
+use warpgate_common::auth::{
+    AuthCredential, AuthResult, AuthState, AuthStateUserInfo, CredentialKind,
+};
 use warpgate_common::{
     Protocol, Secret, TargetKubernetesOptions, User, UserSessionId, WarpgateError,
 };
 use warpgate_common_http::authorization_token;
 use warpgate_common_http::logging::get_client_ip_addr;
+use warpgate_core::auth::submit_credential;
 use warpgate_core::login_protection::FailedAttemptInfo;
 use warpgate_core::{
     AuthorizedIdentity, ConfigProvider, Services, TargetAuthorization, ValidatedTicket,
@@ -28,23 +31,35 @@ use warpgate_db_entities::{CertificateCredential, CertificateRevocation, Paramet
 use crate::server::client_certs::RequestCertificateExt;
 
 pub enum KubernetesIdentity {
-    User(User),
+    /// A user authenticated by transport credential. The credential is
+    /// present only for a verified OIDC ID token (kubelogin) — an API token or
+    /// client certificate authenticates the user directly and carries no
+    /// credential to submit to the Kubernetes credential policy.
+    User(User, Option<AuthCredential>),
     Ticket(ValidatedTicket),
 }
 
 impl KubernetesIdentity {
     pub fn user_info(&self) -> AuthStateUserInfo {
         match self {
-            Self::User(user) => user.into(),
+            Self::User(user, _) => user.into(),
             Self::Ticket(ticket) => ticket.user_info().clone(),
         }
     }
 
     pub fn ticket_id(&self) -> Option<Uuid> {
         match self {
-            Self::User(_) => None,
+            Self::User(..) => None,
             Self::Ticket(ticket) => Some(ticket.id()),
         }
+    }
+
+    /// True for a user authenticated by a verified OIDC ID token. Used to keep
+    /// an OIDC session from correlating with a token/cert session for the same
+    /// user — they can prove different credentials to the policy, so they must
+    /// never share admission.
+    pub fn is_oidc(&self) -> bool {
+        matches!(self, Self::User(_, Some(_)))
     }
 }
 
@@ -123,7 +138,7 @@ pub async fn authenticate_kubernetes_user(
     } else {
         authenticate(req, services)
             .await?
-            .map(KubernetesIdentity::User)
+            .map(|(user, credential)| KubernetesIdentity::User(user, credential))
     };
 
     let Some(identity) = identity else {
@@ -147,7 +162,7 @@ pub async fn authenticate_kubernetes_user(
 
     // Account lockout and the user's IP allow-list, both fail-closed. A ticket's
     // bearer is vetted the same way inside `validate_ticket`.
-    if let KubernetesIdentity::User(user) = &identity
+    if let KubernetesIdentity::User(user, _) = &identity
         && !vet_credential_bearer(&services.login_protection, user, client_ip).await?
     {
         return Err(unauthorized());
@@ -165,10 +180,11 @@ pub async fn authenticate_kubernetes_user(
 }
 
 /// Authorize an already-authenticated user for a Kubernetes target, applying the
-/// credential policy — in practice a web-approval factor, which may block. This is
-/// the expensive step, so the caller caches the result per correlated session so it
-/// runs once per session (one approval per `kubectl` command's fan-out of requests)
-/// rather than once per request.
+/// credential policy — a verified OIDC token can satisfy an `Sso` factor inline,
+/// and an optional web-approval factor may still block. This is the expensive
+/// step, so the caller caches the result per correlated session so it runs once
+/// per session (one approval per `kubectl` command's fan-out of requests) rather
+/// than once per request.
 ///
 /// `session_id` is that of the session the caller has registered for this
 /// request: the auth state is keyed by it, which is what lets a web approval
@@ -190,16 +206,25 @@ pub async fn authenticate_kubernetes_user(
 pub async fn authorize_kubernetes_target(
     req: &Request,
     user: &User,
+    oidc_credential: Option<&AuthCredential>,
     target_name: &str,
     session_id: UserSessionId,
     services: &Services,
 ) -> poem::Result<TargetAuthorization<TargetKubernetesOptions>> {
     let client_ip = get_client_ip_addr(req, services).await;
 
-    // When the user has a Kubernetes credential policy, enforce its web-approval
-    // factor on top of the transport identity; otherwise use the identity directly.
-    let identity =
-        authorize_kubernetes_identity(services, user, client_ip, target_name, session_id).await?;
+    // When the user has a Kubernetes credential policy, enforce it against the
+    // verified transport credential (a verified OIDC token satisfies `Sso`
+    // inline); otherwise use the identity directly.
+    let identity = authorize_kubernetes_identity(
+        services,
+        user,
+        oidc_credential,
+        client_ip,
+        target_name,
+        session_id,
+    )
+    .await?;
 
     let target = lookup_kubernetes_target(services.config_provider.as_ref(), target_name).await?;
 
@@ -230,19 +255,24 @@ pub async fn authorize_kubernetes_target(
 ///
 /// Transport authentication (WG API token, OIDC token, or client certificate)
 /// establishes *who* the caller is — it is the identity, verified out of band by
-/// [`authenticate`]. The Kubernetes credential policy only layers an optional
-/// web-approval factor on top, the one factor a non-interactive client can
-/// satisfy, so no transport credential is ever submitted to the auth state here.
+/// [`authenticate`]. A verified OIDC token additionally carries an `Sso`
+/// credential that is submitted to the credential policy below, so an
+/// `sso`-only Kubernetes policy can be satisfied without browser approval. An
+/// API token or client certificate carries no such credential and so can only
+/// ever satisfy the policy's optional web-approval factor. Either way this is
+/// the one factor a non-interactive client can additionally satisfy on its own.
 ///
 /// With no policy the transport identity is used directly — unless global MFA
 /// enforcement adds a factor for Kubernetes (see `mfa_required_factor`).
-/// Otherwise a fresh auth state enforces the web approval, cleared either by a
-/// cached grace-period bypass or by the user approving the pending request in
-/// the Warpgate UI while the request waits (kubectl has no default client
-/// timeout; the auth-state TTL bounds the wait).
+/// Otherwise a fresh auth state enforces the credential policy, submitting the
+/// OIDC credential when present and then waiting on the web-approval factor,
+/// cleared either by a cached grace-period bypass or by the user approving the
+/// pending request in the Warpgate UI while the request waits (kubectl has no
+/// default client timeout; the auth-state TTL bounds the wait).
 async fn authorize_kubernetes_identity(
     services: &Services,
     user: &User,
+    oidc_credential: Option<&AuthCredential>,
     client_ip: Option<IpAddr>,
     target_name: &str,
     session_id: UserSessionId,
@@ -269,17 +299,39 @@ async fn authorize_kubernetes_identity(
         }
     }
 
+    let mut supported_credential_types = vec![CredentialKind::WebUserApproval];
+    if let Some(credential) = oidc_credential {
+        supported_credential_types.push(credential.kind());
+    }
+
     let state_arc = services
         .create_auth_state(
             &session_id,
             &user.username,
             crate::PROTOCOL_NAME,
             target_name,
-            &[CredentialKind::WebUserApproval],
+            &supported_credential_types,
             client_ip,
             None,
         )
         .await?;
+
+    if let Some(credential) = oidc_credential {
+        let outcome = {
+            let mut state = state_arc.lock().await;
+            submit_credential(
+                &mut state,
+                credential.clone(),
+                services.config_provider.as_ref(),
+                &services.login_protection,
+            )
+            .await?
+        };
+        if !outcome.is_valid() {
+            warn!(username = %user.username, "Kubernetes OIDC credential rejected");
+            return Err(unauthorized());
+        }
+    }
 
     await_kubernetes_web_approval(services, user, &state_arc).await
 }
@@ -310,10 +362,12 @@ async fn await_kubernetes_web_approval(
                     return Err(unauthorized());
                 }
             }
-            // Kubernetes only enforces web approval on top of transport auth; a
-            // policy that requires any other factor can't be collected for a
-            // non-interactive client and is denied. The policy editor should not
-            // offer such a combination.
+            // A verified OIDC token's `Sso` credential was already submitted
+            // above, if there was one to submit; browser approval is the only
+            // other factor a non-interactive client can satisfy. So a policy
+            // still `Need`-ing anything else here — including `Sso` when the
+            // transport credential was an API token or client certificate —
+            // cannot be satisfied and is denied.
             AuthResult::Need(_) | AuthResult::Rejected => {
                 warn!(username = %user.username, "Kubernetes credential policy not satisfiable");
                 return Err(unauthorized());
@@ -325,15 +379,20 @@ async fn await_kubernetes_web_approval(
 /// Resolve the caller's identity from the request's transport credentials (WG API
 /// token, OIDC bearer token, or client certificate). Each is verified here and
 /// establishes *who* the caller is; that transport auth is the identity, so the
-/// caller doesn't re-validate it against a credential policy (a policy only layers
-/// web approval on top). Returns `None` if no presented credential validated;
-/// genuine lookup/verification errors propagate rather than being treated as a
-/// failure.
-async fn authenticate(req: &Request, services: &Services) -> poem::Result<Option<User>> {
+/// caller doesn't re-validate an API token or client certificate against a
+/// credential policy (a policy only layers web approval on top of those). A
+/// verified OIDC token additionally returns an `Sso` credential the caller can
+/// submit to the policy, so an `sso`-only policy is satisfied without browser
+/// approval. Returns `None` if no presented credential validated; genuine
+/// lookup/verification errors propagate rather than being treated as a failure.
+async fn authenticate(
+    req: &Request,
+    services: &Services,
+) -> poem::Result<Option<(User, Option<AuthCredential>)>> {
     // Bearer token authentication (API tokens, then OIDC ID tokens).
     if let Some(token) = authorization_token(req, "Bearer") {
         if let Ok(Some(user)) = services.config_provider.validate_api_token(token).await {
-            return Ok(Some(user));
+            return Ok(Some((user, None)));
         }
 
         // API token did not match — try OIDC ID token validation against any SSO
@@ -373,6 +432,14 @@ async fn authenticate(req: &Request, services: &Services) -> poem::Result<Option
                 }
             };
 
+            // Warpgate's canonical SSO resolver keys a user linkage on the
+            // provider and verified email. That linkage is also what backs an
+            // `Sso` credential-policy check and a server-side ticket grant, so
+            // an OIDC token without an email claim cannot authenticate here.
+            let Some(email) = response.email.clone() else {
+                continue;
+            };
+
             let Some(username) = warpgate_core::resolve_and_map_sso_user(
                 services.config_provider.as_ref(),
                 provider_config,
@@ -389,11 +456,17 @@ async fn authenticate(req: &Request, services: &Services) -> poem::Result<Option
                 continue;
             };
 
-            // The verified OIDC token is the identity; it is not re-checked against
-            // the stored-SSO-linkage `validate_credential` arm, which would deny
-            // legitimately-authenticated users resolved via preferred-username or
-            // role mapping.
-            return Ok(Some(user_for_username(services, &username).await?));
+            // The verified OIDC token is the identity outright; resolving it
+            // never depends on a stored SSO-credential match (this also covers
+            // a user resolved via preferred-username or role mapping). The
+            // credential below is only ever submitted afterwards, and only to
+            // satisfy an `Sso` credential-policy requirement.
+            let user = user_for_username(services, &username).await?;
+            let credential = AuthCredential::Sso {
+                provider: provider_config.name.clone(),
+                email,
+            };
+            return Ok(Some((user, Some(credential))));
         }
     }
 
@@ -403,7 +476,7 @@ async fn authenticate(req: &Request, services: &Services) -> poem::Result<Option
         debug!("Found client certificate from middleware, validating against database");
 
         match validate_client_certificate(&client_cert.der_bytes, services).await {
-            Ok(Some(user)) => return Ok(Some(user)),
+            Ok(Some(user)) => return Ok(Some((user, None))),
             Ok(None) => debug!("Client certificate provided but not found in database"),
             // A rejected certificate returns `Ok(None)`; an `Err` is a fault in the
             // certificate store (DB) or an unparseable cert, not a credential
