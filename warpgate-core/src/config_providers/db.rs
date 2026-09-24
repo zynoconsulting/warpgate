@@ -453,15 +453,17 @@ impl ConfigProvider for DatabaseConfigProvider {
                 protocols: HashMap::new(),
             };
 
-            // Only HTTP performs an SSO exchange inline; no other protocol can
-            // carry one on the wire, so there a required `Sso` is satisfied by
-            // the in-browser approval flow instead. Keyed off the protocol
-            // rather than a per-entry flag so the rule has one statement.
+            // HTTP and Kubernetes can both carry a verified OIDC ID token. For
+            // the remaining protocols, a required `Sso` is satisfied by the
+            // in-browser approval flow instead. Keyed off the protocol rather
+            // than a per-entry flag so the rule has one statement.
             let make_policy = |protocol: Protocol, required: Vec<CredentialKind>| {
                 let required_credential_types = required
                     .into_iter()
                     .map(|kind| match (kind, protocol) {
-                        (CredentialKind::Sso, Protocol::Http) => CredentialKind::Sso,
+                        (CredentialKind::Sso, Protocol::Http | Protocol::Kubernetes) => {
+                            CredentialKind::Sso
+                        }
                         (CredentialKind::Sso, _) => CredentialKind::WebUserApproval,
                         (kind, _) => kind,
                     })
@@ -1019,7 +1021,7 @@ impl ConfigProvider for DatabaseConfigProvider {
 mod tests {
     use sea_orm::ActiveValue::Set;
     use sea_orm::{ActiveModelTrait, Database};
-    use warpgate_common::auth::StoredCredentials;
+    use warpgate_common::auth::{CredentialPolicyResponse, StoredCredentials};
     use warpgate_common::helpers::hash::hash_password;
     use warpgate_db_entities::Parameters::{ConfigMigrationValues, set_config_migration_values};
     use warpgate_db_migrations::migrate_database;
@@ -1363,6 +1365,63 @@ mod tests {
                 .await
                 .unwrap(),
             None,
+        );
+    }
+
+    /// Kubernetes can carry a verified OIDC ID token, so a required `Sso`
+    /// factor must reach the credential policy as `Sso` — not silently become
+    /// `WebUserApproval` the way a required `Sso` does for every other
+    /// non-HTTP protocol.
+    #[tokio::test]
+    async fn kubernetes_credential_policy_requires_sso_not_web_approval() {
+        set_config_migration_values(ConfigMigrationValues::default());
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        migrate_database(&db).await.unwrap();
+
+        entities::User::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            username: Set("oidc-user".to_owned()),
+            description: Set(String::new()),
+            credential_policy: Set(serde_json::json!({ "kubernetes": ["sso"] })),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        let provider = DatabaseConfigProvider::new(&db);
+        let policy = provider
+            .get_credential_policy(
+                "oidc-user",
+                &[CredentialKind::WebUserApproval, CredentialKind::Sso],
+            )
+            .await
+            .unwrap()
+            .expect("a policy for a known user");
+
+        assert!(
+            matches!(
+                policy.is_sufficient(
+                    Protocol::Kubernetes,
+                    &[CredentialKind::Sso].into_iter().collect(),
+                ),
+                CredentialPolicyResponse::Ok
+            ),
+            "a verified OIDC `Sso` credential must satisfy the policy on its own",
+        );
+
+        let CredentialPolicyResponse::Need(needed) =
+            policy.is_sufficient(Protocol::Kubernetes, &HashSet::new())
+        else {
+            panic!("expected Need when no credential has been submitted");
+        };
+        assert!(
+            needed.contains(&CredentialKind::Sso),
+            "the required factor must be Sso, not WebUserApproval: {needed:?}",
+        );
+        assert!(
+            !needed.contains(&CredentialKind::WebUserApproval),
+            "Kubernetes must not silently fall back to WebUserApproval: {needed:?}",
         );
     }
 }
