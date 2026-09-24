@@ -28,6 +28,12 @@ pub(crate) struct CorrelationKey {
     // Ticket sessions must never share admission with another ticket or a
     // normal login by the same user.
     ticket_id: Option<Uuid>,
+    // A verified OIDC identity carries its own `Sso` credential into the
+    // credential policy; a token/cert session for the same user does not. Two
+    // otherwise-identical sessions must not correlate together, or one could
+    // reuse the other's authorization despite having proved a different
+    // credential.
+    oidc: bool,
 }
 
 impl CorrelationKey {
@@ -42,6 +48,7 @@ impl CorrelationKey {
             target_name,
             ip: get_client_ip(request, services).await,
             ticket_id: identity.ticket_id(),
+            oidc: identity.is_oidc(),
         }
     }
 }
@@ -203,10 +210,11 @@ pub async fn correlated_authorization(
 
         let resolved = match identity {
             // close cancels authorization wait
-            KubernetesIdentity::User(user) => closed
+            KubernetesIdentity::User(user, credential) => closed
                 .run_until_cancelled(authorize_kubernetes_target(
                     request,
                     &user,
+                    credential.as_ref(),
                     target_name,
                     session_id,
                     services,
@@ -520,5 +528,32 @@ mod tests {
         let closed = CancellationToken::new();
         let created = Instant::now() - Duration::from_secs(120);
         assert!(!entry_is_live(created, &closed, Duration::from_secs(60)));
+    }
+
+    use std::collections::HashSet;
+
+
+    fn key(oidc: bool) -> CorrelationKey {
+        CorrelationKey {
+            user_id: Uuid::nil(),
+            target_name: "target".to_owned(),
+            ip: None,
+            ticket_id: None,
+            oidc,
+        }
+    }
+
+    /// An OIDC session and a token/cert session for the same user, target and
+    /// source IP must never correlate together: they can prove different
+    /// credentials to the Kubernetes credential policy, so one must not reuse
+    /// the other's authorization.
+    #[test]
+    fn oidc_flag_distinguishes_otherwise_identical_keys() {
+        assert!(key(true) != key(false));
+
+        let mut seen: HashSet<CorrelationKey> = HashSet::new();
+        assert!(seen.insert(key(true)));
+        assert!(seen.insert(key(false)));
+        assert_eq!(seen.len(), 2);
     }
 }
