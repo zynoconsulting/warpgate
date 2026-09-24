@@ -27,7 +27,8 @@ use warpgate_common::auth::{
 use warpgate_common::eventhub::{EventHub, EventSender};
 use warpgate_common::helpers::username::username_eq_ci;
 use warpgate_common::{
-    Secret, Target, TargetOptions, TargetSSHOptions, TargetSessionId, UserSessionId, WarpgateError,
+    Secret, Target, TargetOptions, TargetSSHOptions, TargetSessionId, User,
+    UserRequireCredentialsPolicy, UserSessionId, WarpgateError,
 };
 use warpgate_common_http::ext::construct_external_url;
 use warpgate_core::approvals::{GateOutcome, GatedConnection};
@@ -37,7 +38,7 @@ use warpgate_core::recordings::{self, TerminalRecorder, TrafficConnectionParams,
 use warpgate_core::{
     AdmittedTarget, ApprovedTarget, AuthorizedIdentity, ConfigProvider, Services,
     TargetAuthorization, TargetSessionStart, WarpgateServerHandle,
-    authorize_active_self_service_ticket, authorize_and_spend_ticket, authorize_for_target,
+    authorize_active_self_service_ticket, authorize_for_target, validate_ticket,
 };
 use warpgate_db_entities::Parameters;
 use warpgate_db_entities::Parameters::SshHostKeyVerificationMode;
@@ -242,12 +243,63 @@ fn reject_with_allowed_auth_methods(allowed_auth_methods: MethodSet) -> russh::s
     }
 }
 
+/// A ticket secret used directly as the credential (the `ticket-<secret>@...`
+/// username) can't satisfy any credential-policy factor -- it isn't a public
+/// key, an SSO assertion, a TOTP code, etc. So an explicit, non-empty SSH
+/// entry in the user's credential policy means a ticket secret alone must not
+/// be accepted as a login for that user, even though the ticket itself is
+/// valid.
+///
+/// Users with no explicit SSH policy (`None`, or an empty list -- the two are
+/// equivalent, see `credential_entry_is_unset`) keep today's behavior.
+fn ssh_policy_requires_credentials(policy: Option<&UserRequireCredentialsPolicy>) -> bool {
+    policy
+        .and_then(|p| p.ssh.as_ref())
+        .is_some_and(|kinds| !kinds.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use russh::{MethodKind, MethodSet};
     use uuid::Uuid;
+    use warpgate_common::UserRequireCredentialsPolicy;
+    use warpgate_common::auth::CredentialKind;
 
-    use super::{CachedActiveTicketGrant, reject_with_allowed_auth_methods};
+    use super::{
+        CachedActiveTicketGrant, reject_with_allowed_auth_methods, ssh_policy_requires_credentials,
+    };
+
+    #[test]
+    fn ssh_policy_requires_credentials_is_false_with_no_policy() {
+        assert!(!ssh_policy_requires_credentials(None));
+    }
+
+    #[test]
+    fn ssh_policy_requires_credentials_is_false_with_empty_ssh_policy() {
+        let policy = UserRequireCredentialsPolicy {
+            ssh: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(!ssh_policy_requires_credentials(Some(&policy)));
+    }
+
+    #[test]
+    fn ssh_policy_requires_credentials_is_false_when_ssh_unset_but_other_protocols_set() {
+        let policy = UserRequireCredentialsPolicy {
+            http: Some(vec![CredentialKind::Sso]),
+            ..Default::default()
+        };
+        assert!(!ssh_policy_requires_credentials(Some(&policy)));
+    }
+
+    #[test]
+    fn ssh_policy_requires_credentials_is_true_with_explicit_ssh_policy() {
+        let policy = UserRequireCredentialsPolicy {
+            ssh: Some(vec![CredentialKind::PublicKey]),
+            ..Default::default()
+        };
+        assert!(ssh_policy_requires_credentials(Some(&policy)));
+    }
 
     #[test]
     fn rejected_public_key_auth_advertises_only_configured_methods() {
@@ -2583,7 +2635,11 @@ impl ServerSession {
                 }
             }
             AuthSelector::Ticket { secret } => {
-                match authorize_and_spend_ticket(
+                // `authorize_and_spend_ticket` (validate + spend) is inlined
+                // here as its two halves, so the credential-policy check
+                // below can run between them -- after the ticket is known to
+                // be genuine, but strictly before its one use is spent.
+                match validate_ticket(
                     &self.services.db,
                     &self.services.login_protection,
                     secret,
@@ -2592,27 +2648,60 @@ impl ServerSession {
                 )
                 .await?
                 {
-                    Some(authorization) => {
-                        info!(
-                            "Authorized for {} with a ticket",
-                            authorization.target().name
-                        );
-                        let user_info = authorization.user_info().clone();
-                        // The ticket could be revoked or expire in the gap
-                        // between validating it above and admission here; that
-                        // is an ordinary auth rejection, not a session error.
-                        match self
-                            ._auth_accept(user_info.clone(), Some(authorization))
-                            .await
-                        {
-                            Ok(()) => Ok(AuthResult::Accepted { user_info }),
-                            Err(WarpgateError::TargetAccessRevoked) => {
-                                warn!(
-                                    "Ticket was revoked or expired before the session could start"
+                    Some(validated_ticket) => {
+                        let user_info = validated_ticket.user_info().clone();
+
+                        // A ticket secret used as the `ticket-<secret>@...`
+                        // username can't satisfy any credential-policy factor.
+                        // If this user has an explicit, non-empty SSH policy,
+                        // refuse the ticket-secret login outright rather than
+                        // spending the ticket's use on an attempt that could
+                        // never have been genuinely authorized.
+                        let ticket_user: Option<User> = self
+                            .services
+                            .config_provider
+                            .list_users()
+                            .await?
+                            .into_iter()
+                            .find(|u| username_eq_ci(&u.username, &user_info.username));
+                        if ssh_policy_requires_credentials(
+                            ticket_user
+                                .as_ref()
+                                .and_then(|u| u.credential_policy.as_ref()),
+                        ) {
+                            warn!(
+                                username = %user_info.username,
+                                "Ticket-secret SSH login rejected: user's credential policy \
+                                 requires credentials a ticket secret cannot provide"
+                            );
+                            return Ok(AuthResult::Rejected);
+                        }
+
+                        match validated_ticket.spend(&self.services.db).await? {
+                            Some(authorization) => {
+                                info!(
+                                    "Authorized for {} with a ticket",
+                                    authorization.target().name
                                 );
-                                Ok(AuthResult::Rejected)
+                                let user_info = authorization.user_info().clone();
+                                // The ticket could be revoked or expire in the gap
+                                // between validating it above and admission here; that
+                                // is an ordinary auth rejection, not a session error.
+                                match self
+                                    ._auth_accept(user_info.clone(), Some(authorization))
+                                    .await
+                                {
+                                    Ok(()) => Ok(AuthResult::Accepted { user_info }),
+                                    Err(WarpgateError::TargetAccessRevoked) => {
+                                        warn!(
+                                            "Ticket was revoked or expired before the session could start"
+                                        );
+                                        Ok(AuthResult::Rejected)
+                                    }
+                                    Err(error) => Err(error.into()),
+                                }
                             }
-                            Err(error) => Err(error.into()),
+                            None => Ok(AuthResult::Rejected),
                         }
                     }
                     None => Ok(AuthResult::Rejected),
