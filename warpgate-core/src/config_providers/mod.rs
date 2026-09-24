@@ -392,12 +392,10 @@ async fn grant_active_self_service_ticket(
 /// itself verify that `identity`'s caller was fully authenticated — it takes
 /// that on faith from `AuthorizedIdentity` and only ever supplies the
 /// temporary target grant on top of it. The ordering guarantee comes from its
-/// callers — `authorize_kubernetes_target` in `warpgate-protocol-kubernetes`,
-/// `db_auth::authorize_for_target_or_ticket` (MySQL/PostgreSQL), and the SSH
-/// `user:target` auth-accept path in `warpgate-protocol-ssh` — which each run
-/// the full identity check (transport credential and, where configured,
-/// credential policy / MFA) before constructing the `identity` they pass in
-/// here.
+/// single caller, `authorize_kubernetes_target` in
+/// `warpgate-protocol-kubernetes`, which runs the full identity check
+/// (transport credential and, where configured, credential policy / MFA)
+/// before constructing the `identity` it passes in here.
 pub async fn authorize_active_self_service_ticket(
     db: &DatabaseConnection,
     identity: AuthorizedIdentity,

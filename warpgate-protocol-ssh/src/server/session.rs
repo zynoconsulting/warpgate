@@ -127,9 +127,9 @@ struct CachedSuccessfulTicketAuth {
 /// `try_auth_eager`'s `AuthResult::Accepted` branch is not a one-shot: the
 /// backing `AuthState` is cached per (username, target) on the session (see
 /// [`ServerSession::get_auth_state`]) and re-verified on every call, so an
-/// offer-phase probe, a retried auth method, or a client that pipelines an
-/// extra auth request after success can all re-enter it once it has already
-/// gone `Accepted`. Each re-entry would otherwise call
+/// offer-phase probe or a retried auth method after an earlier rejection can
+/// re-enter it once the state has already gone `Accepted`. Each re-entry would
+/// otherwise call
 /// [`authorize_active_self_service_ticket`] again and spend another use.
 struct CachedActiveTicketGrant {
     username: String,
@@ -2562,7 +2562,13 @@ impl ServerSession {
                         // and admission here; that is an ordinary auth rejection,
                         // not a session error (mirrors the ticket-secret path
                         // below).
-                        match self._auth_accept(user_info.clone(), authorization).await {
+                        let accepted = self._auth_accept(user_info.clone(), authorization).await;
+                        if accepted.is_err() {
+                            // A failed admission must not leave a grant behind
+                            // for a retry to reuse without re-checking it.
+                            self.cached_active_ticket_grant = None;
+                        }
+                        match accepted {
                             Ok(()) => Ok(AuthResult::Accepted { user_info }),
                             Err(WarpgateError::TargetAccessRevoked) => {
                                 warn!(

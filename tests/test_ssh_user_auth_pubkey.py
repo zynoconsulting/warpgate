@@ -131,15 +131,15 @@ def _create_ssh_target(api, ssh_port):
     )
 
 
-def _ssh_ls_bin_sh(processes, shared_wg, user, target, timeout):
-    """Attempts SSH public-key auth as `user:target`, waiting for the client
-    to exit."""
+def _ssh_ls_bin_sh(processes, shared_wg, user, target, identity="ssh-keys/id_ed25519"):
+    """Starts SSH public-key auth as `user:target`; the caller waits for the
+    client to exit."""
     return processes.start_ssh_client(
         f"{user.username}:{target.name}@localhost",
         "-p",
         str(shared_wg.ssh_port),
         "-o",
-        "IdentityFile=ssh-keys/id_ed25519",
+        f"IdentityFile={identity}",
         "-o",
         "PreferredAuthentications=publickey",
         "ls",
@@ -340,9 +340,40 @@ class Test:
         try:
             _activate_self_service_ticket(url, user.username, ssh_target.name)
 
-            ssh_client = _ssh_ls_bin_sh(processes, shared_wg, user, ssh_target, timeout)
+            ssh_client = _ssh_ls_bin_sh(processes, shared_wg, user, ssh_target)
             assert ssh_client.communicate(timeout=timeout)[0] == b"/bin/sh\n"
             assert ssh_client.returncode == 0
+        finally:
+            _disable_self_service(url)
+
+    def test_active_ticket_does_not_bypass_the_users_public_key(
+        self,
+        processes: ProcessManager,
+        wg_c_ed25519_pubkey: Path,
+        timeout,
+        shared_wg: WarpgateProcess,
+    ):
+        """The ticket supplies only the target grant: a key the user never
+        registered is still rejected."""
+        ssh_port = processes.start_ssh_server(
+            trusted_keys=[wg_c_ed25519_pubkey.read_text()]
+        )
+        wait_port(ssh_port)
+
+        url = f"https://localhost:{shared_wg.http_port}"
+        with admin_client(url) as api:
+            user = _create_role_less_user(api)
+            ssh_target = _create_ssh_target(api, ssh_port)
+
+        _enable_self_service(url)
+        try:
+            _activate_self_service_ticket(url, user.username, ssh_target.name)
+
+            ssh_client = _ssh_ls_bin_sh(
+                processes, shared_wg, user, ssh_target, identity="ssh-keys/id_rsa"
+            )
+            assert ssh_client.communicate(timeout=timeout)[0] == b""
+            assert ssh_client.returncode != 0
         finally:
             _disable_self_service(url)
 
@@ -364,7 +395,7 @@ class Test:
             user = _create_role_less_user(api)
             ssh_target = _create_ssh_target(api, ssh_port)
 
-        ssh_client = _ssh_ls_bin_sh(processes, shared_wg, user, ssh_target, timeout)
+        ssh_client = _ssh_ls_bin_sh(processes, shared_wg, user, ssh_target)
         assert ssh_client.communicate(timeout=timeout)[0] == b""
         assert ssh_client.returncode != 0
 
@@ -378,11 +409,9 @@ class Test:
         """A ticket that is no longer active must not grant access.
 
         Revoked rather than expired: the self-service ticket-request flow
-        enforces a 60-second minimum duration
-        (warpgate-core/src/ticket_requests.rs), so waiting out a real expiry
-        would only make the test slower, not exercise a different check --
-        the eligibility query behind the grant (`grant_active_self_service_ticket`)
-        excludes a revoked ticket the same way it excludes an expired one.
+        enforces a 60-second minimum duration, so a real expiry would make
+        this test slow. Expired tickets are covered by the core unit test
+        `expired_self_service_ticket_never_grants`.
         """
         ssh_port = processes.start_ssh_server(
             trusted_keys=[wg_c_ed25519_pubkey.read_text()]
@@ -401,7 +430,7 @@ class Test:
             )
             _revoke_own_ticket(session, url, ticket_id)
 
-            ssh_client = _ssh_ls_bin_sh(processes, shared_wg, user, ssh_target, timeout)
+            ssh_client = _ssh_ls_bin_sh(processes, shared_wg, user, ssh_target)
             assert ssh_client.communicate(timeout=timeout)[0] == b""
             assert ssh_client.returncode != 0
         finally:
@@ -430,7 +459,7 @@ class Test:
         try:
             _activate_self_service_ticket(url, user.username, other_target.name)
 
-            ssh_client = _ssh_ls_bin_sh(processes, shared_wg, user, ssh_target, timeout)
+            ssh_client = _ssh_ls_bin_sh(processes, shared_wg, user, ssh_target)
             assert ssh_client.communicate(timeout=timeout)[0] == b""
             assert ssh_client.returncode != 0
         finally:
@@ -483,7 +512,8 @@ class Test:
 
             _revoke_own_ticket(session, url, ticket_id)
 
-            assert ssh_client.wait(timeout=30) is not None, "session was not closed"
+            # Raises TimeoutExpired if the session is not closed.
+            ssh_client.wait(timeout=30)
             assert _poll(lambda: _session_ended(url, user.username, "SSH")), (
                 "session never marked ended after its ticket was revoked"
             )
