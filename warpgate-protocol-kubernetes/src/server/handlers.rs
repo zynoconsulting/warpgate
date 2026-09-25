@@ -530,12 +530,7 @@ async fn _handle_websocket_request_inner(
         }
     };
 
-    let ws_protocol = req
-        .headers()
-        .get("sec-websocket-protocol")
-        .and_then(|h| h.to_str().ok())
-        .context("missing Sec-Websocket-Protocol request header")?
-        .to_string();
+    let ws_protocols = requested_websocket_protocols(req.headers());
 
     let audit_subject = audit_subject.clone();
 
@@ -543,7 +538,7 @@ async fn _handle_websocket_request_inner(
         let client_response = client
             .get(full_url.clone())
             .upgrade()
-            .protocols(vec![ws_protocol])
+            .protocols(ws_protocols)
             .send()
             .await
             .context("sending websocket request to Kubernetes API")?;
@@ -640,8 +635,45 @@ async fn _handle_websocket_request_inner(
         .into_response())
 }
 
+/// The subprotocols the client offered, in order, to request from the API
+/// server in turn. A client may offer none: the API server then speaks the
+/// original `channel.k8s.io` framing, which is still accepted (kubectl always
+/// offers `v5`/`v4.channel.k8s.io`, but other clients don't).
+fn requested_websocket_protocols(headers: &http::HeaderMap) -> Vec<String> {
+    headers
+        .get_all(http::header::SEC_WEBSOCKET_PROTOCOL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|protocol| !protocol.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn websocket_protocols_are_optional_and_split() {
+        use super::requested_websocket_protocols;
+
+        let mut headers = http::HeaderMap::new();
+        assert!(requested_websocket_protocols(&headers).is_empty());
+
+        headers.append(
+            http::header::SEC_WEBSOCKET_PROTOCOL,
+            http::HeaderValue::from_static("v5.channel.k8s.io, v4.channel.k8s.io"),
+        );
+        headers.append(
+            http::header::SEC_WEBSOCKET_PROTOCOL,
+            http::HeaderValue::from_static("channel.k8s.io"),
+        );
+        assert_eq!(
+            requested_websocket_protocols(&headers),
+            ["v5.channel.k8s.io", "v4.channel.k8s.io", "channel.k8s.io"]
+        );
+    }
+
     use std::collections::HashMap;
 
     use super::{is_impersonation_header, named_target_path, redact_headers};
