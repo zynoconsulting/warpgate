@@ -21,6 +21,7 @@
     import Loadable from 'common/Loadable.svelte'
     import RelativeDate from 'common/RelativeDate.svelte'
     import { statusColor, statusIcon } from 'common/ticketRequestStatus'
+    import { api as adminApi } from 'admin/lib/api'
     import {
         type ActivatedTicketTargetInfo,
         api,
@@ -113,6 +114,9 @@
     let descriptionRequired = $derived(
         $serverInfo?.ticketRequireDescription ?? false,
     )
+    let canManageTicketRequests = $derived(
+        $serverInfo?.adminPermissions?.ticketRequestsManage ?? false,
+    )
     let descriptionMissing = $derived(
         descriptionRequired && !description.trim(),
     )
@@ -178,6 +182,21 @@
         lastSecret = undefined
         lastTarget = undefined
         descriptionTouched = false
+    }
+
+    async function approveRequest(request: TicketRequestModel) {
+        error = undefined
+        success = undefined
+        lastSecret = undefined
+        lastTargetName = undefined
+        try {
+            await adminApi.approveTicketRequest({ id: request.id })
+            success = 'Ticket request approved. You can now activate it.'
+            await load()
+        } catch (err) {
+            error = await stringifyError(err)
+            throw err
+        }
     }
 
     async function activateRequest(request: TicketRequestModel) {
@@ -377,6 +396,14 @@
                                 >
                             {/if}
                         </div>
+                        {#if request.status === TicketRequestStatus.Pending && canManageTicketRequests}
+                            <AsyncButton
+                                color="success"
+                                click={() => approveRequest(request)}
+                            >
+                                Approve
+                            </AsyncButton>
+                        {/if}
                         {#if request.status === TicketRequestStatus.Approved && !request.ticketId}
                             <AsyncButton
                                 color="success"
