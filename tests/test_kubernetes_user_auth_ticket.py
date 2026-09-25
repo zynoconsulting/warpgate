@@ -280,6 +280,9 @@ async def test_websocket_without_subprotocol_is_proxied(shared_wg, ticket_setup)
             return web.json_response({})
         offered.append(req.headers.get("Sec-WebSocket-Protocol"))
         ws = web.WebSocketResponse(protocols=["v4.channel.k8s.io"])
+        if offered[-1] is None:
+            # What the API server sends when offered no subprotocol.
+            ws.headers["Sec-WebSocket-Protocol"] = ""
         await ws.prepare(req)
         async for message in ws:
             await ws.send_str(message.data)
