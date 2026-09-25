@@ -8,6 +8,7 @@
         ModalBody,
         ModalFooter,
     } from '@sveltestrap/sveltestrap'
+    import { api as adminApi } from 'admin/lib/api'
     import AsyncButton from 'common/AsyncButton.svelte'
     import ConnectionInstructions from 'common/ConnectionInstructions.svelte'
     import {
@@ -21,7 +22,6 @@
     import Loadable from 'common/Loadable.svelte'
     import RelativeDate from 'common/RelativeDate.svelte'
     import { statusColor, statusIcon } from 'common/ticketRequestStatus'
-    import { api as adminApi } from 'admin/lib/api'
     import {
         type ActivatedTicketTargetInfo,
         api,
@@ -188,7 +188,7 @@
         error = undefined
         success = undefined
         lastSecret = undefined
-        lastTargetName = undefined
+        lastTarget = undefined
         try {
             await adminApi.approveTicketRequest({ id: request.id })
             success = 'Ticket request approved. You can now activate it.'
