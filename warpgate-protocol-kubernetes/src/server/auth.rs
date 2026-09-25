@@ -405,7 +405,9 @@ async fn await_kubernetes_web_approval(
             // approval timed out.
             AuthResult::Need(kinds)
                 if !kinds.is_empty()
-                    && kinds.iter().all(|kind| *kind == CredentialKind::WebUserApproval) =>
+                    && kinds
+                        .iter()
+                        .all(|kind| *kind == CredentialKind::WebUserApproval) =>
             {
                 if services.try_web_approval_bypass(state_arc).await? {
                     continue;

@@ -322,7 +322,13 @@ async fn join_session(
     slot: SharedAuthorization,
     closed: CancellationToken,
     services: &Services,
-) -> poem::Result<Option<(Arc<Mutex<WarpgateServerHandle>>, AdmittedSession, CancellationToken)>> {
+) -> poem::Result<
+    Option<(
+        Arc<Mutex<WarpgateServerHandle>>,
+        AdmittedSession,
+        CancellationToken,
+    )>,
+> {
     // Cloned out so the slot lock is not held while taking the correlator lock.
     let outcome = slot.lock().await.clone();
     match outcome {
