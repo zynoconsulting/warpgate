@@ -29,6 +29,37 @@ pub struct DatabaseConfigProvider {
     db: DatabaseConnection,
 }
 
+/// Returns the key material in a canonical form, excluding the optional
+/// human-readable OpenSSH comment.
+fn canonical_openssh_public_key(openssh_public_key: &str) -> Option<String> {
+    let mut key = russh::keys::PublicKey::from_openssh(openssh_public_key).ok()?;
+    key.set_comment("");
+    key.to_openssh().ok()
+}
+
+fn public_keys_match(stored_public_key: &str, presented_public_key: &str) -> bool {
+    canonical_openssh_public_key(stored_public_key)
+        .is_some_and(|stored_key| stored_key == presented_public_key)
+}
+
+#[cfg(test)]
+mod public_key_tests {
+    use super::public_keys_match;
+
+    #[test]
+    fn public_key_matching_ignores_openssh_comments() {
+        let mut fields = include_str!("../../../tests/ssh-keys/id_ed25519.pub").split_whitespace();
+        let key_material = format!(
+            "{} {}",
+            fields.next().expect("public key type"),
+            fields.next().expect("public key material"),
+        );
+        let stored_public_key = format!("{key_material} workstation@example.com");
+
+        assert!(public_keys_match(&stored_public_key, &key_material));
+    }
+}
+
 /// Joins active (non-revoked, non-expired) user role assignments to target
 /// role assignments; callers add the authorization predicates and selection.
 fn active_role_assignment_query() -> sea_orm::sea_query::SelectStatement {
@@ -621,7 +652,7 @@ impl ConfigProvider for DatabaseConfigProvider {
                     .all(db)
                     .await?
                     .into_iter()
-                    .find(|c| c.openssh_public_key == openssh_public_key)
+                    .find(|c| public_keys_match(&c.openssh_public_key, &openssh_public_key))
                     .map(|c| {
                         StoredCredential::new(
                             StoredCredentialKind::PublicKey,
@@ -935,6 +966,7 @@ impl ConfigProvider for DatabaseConfigProvider {
 
     async fn update_public_key_last_used(
         &self,
+        username: &str,
         credential: Option<AuthCredential>,
     ) -> Result<(), WarpgateError> {
         let db = &self.db;
@@ -957,14 +989,32 @@ impl ConfigProvider for DatabaseConfigProvider {
             openssh_public_key
         );
 
-        // Find the public key credential
-        let public_key_credential = entities::PublicKeyCredential::Entity::find()
-            .filter(
-                entities::PublicKeyCredential::Column::OpensshPublicKey
-                    .eq(openssh_public_key.clone()),
-            )
+        let user = entities::User::Entity::find()
+            .filter(entities::User::Entity::username_eq_ci(username))
             .one(db)
             .await?;
+
+        let Some(user) = user else {
+            warn!("User not found while updating public key usage: {username}");
+            return Ok(());
+        };
+
+        // Stored keys can include a comment, while SSH authentication presents
+        // key material only. Resolve the matching credential for this user by
+        // its canonical key material rather than by its original text. Order
+        // by id, same as `validate_credential`: if the user has enrolled the
+        // same key material twice under different comments, both paths must
+        // agree on which row is "the" credential, or the timestamp can land
+        // on a different row than the one that authenticated.
+        let public_key_credential = entities::PublicKeyCredential::Entity::find()
+            .filter(entities::PublicKeyCredential::Column::UserId.eq(user.id))
+            .order_by_asc(entities::PublicKeyCredential::Column::Id)
+            .all(db)
+            .await?
+            .into_iter()
+            .find(|stored_credential| {
+                public_keys_match(&stored_credential.openssh_public_key, &openssh_public_key)
+            });
 
         let Some(public_key_credential) = public_key_credential else {
             warn!(
@@ -1152,6 +1202,23 @@ mod tests {
     async fn add_key(db: &DatabaseConnection, user_id: Uuid, key: &str) -> Uuid {
         entities::PublicKeyCredential::ActiveModel {
             id: Set(Uuid::new_v4()),
+            user_id: Set(user_id),
+            label: Set(String::new()),
+            date_added: Set(None),
+            last_used: Set(None),
+            openssh_public_key: Set(key.to_owned()),
+        }
+        .insert(db)
+        .await
+        .unwrap()
+        .id
+    }
+
+    /// Like [`add_key`], but with a caller-chosen id instead of a random one, so a test
+    /// can control how insertion order relates to id order.
+    async fn add_key_with_id(db: &DatabaseConnection, id: Uuid, user_id: Uuid, key: &str) -> Uuid {
+        entities::PublicKeyCredential::ActiveModel {
+            id: Set(id),
             user_id: Set(user_id),
             label: Set(String::new()),
             date_added: Set(None),
@@ -1363,6 +1430,81 @@ mod tests {
                 .await
                 .unwrap(),
             None,
+        );
+    }
+
+    /// Stored keys are typically pasted with their OpenSSH comment
+    /// (`ssh-keygen`'s default format), while the client presents bare key
+    /// material. Authentication must compare canonical material, not the
+    /// stored row's exact text.
+    #[tokio::test]
+    async fn validate_credential_accepts_a_stored_keys_comment() {
+        set_config_migration_values(ConfigMigrationValues::default());
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        migrate_database(&db).await.unwrap();
+
+        let key_material =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKp8kMhTHrJRfKPQD5vJ3vRZ0F3sZbXQ0m5vZ8xJvVQe";
+        let user_id = user_named(&db, "alice").await;
+        add_key(&db, user_id, &format!("{key_material} alice@laptop")).await;
+
+        let provider = DatabaseConfigProvider::new(&db);
+        let accepted = provider
+            .validate_credential("alice", &offered_key(key_material))
+            .await
+            .unwrap();
+        assert!(
+            accepted.is_some(),
+            "a key stored with its comment must still validate"
+        );
+    }
+
+    /// A user can enroll the same key material twice under different
+    /// comments. Authentication resolves ties by the lowest id
+    /// (`validate_credential`'s `order_by_asc(Id)`); `update_public_key_last_used`
+    /// must resolve to that very same row, or the timestamp lands on
+    /// whichever row the database happens to return first.
+    #[tokio::test]
+    async fn update_public_key_last_used_matches_authentications_ordering() {
+        set_config_migration_values(ConfigMigrationValues::default());
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        migrate_database(&db).await.unwrap();
+
+        let key_material =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKp8kMhTHrJRfKPQD5vJ3vRZ0F3sZbXQ0m5vZ8xJvVQe";
+        let user_id = user_named(&db, "alice").await;
+        // Fixed ids, the higher one inserted first, so insertion order and id order
+        // disagree. With random ids this only failed without `order_by_asc(Id)` about
+        // half the time -- whenever the second-inserted row happened to get the lower
+        // id -- so it's pinned down here instead of left to chance.
+        let higher_id = Uuid::from_u128(2);
+        let lower_id = Uuid::from_u128(1);
+        add_key_with_id(&db, higher_id, user_id, &format!("{key_material} work")).await;
+        add_key_with_id(&db, lower_id, user_id, &format!("{key_material} home")).await;
+
+        let provider = DatabaseConfigProvider::new(&db);
+        provider
+            .update_public_key_last_used("alice", Some(offered_key(key_material)))
+            .await
+            .unwrap();
+
+        let lower = entities::PublicKeyCredential::Entity::find_by_id(lower_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        let higher = entities::PublicKeyCredential::Entity::find_by_id(higher_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            lower.last_used.is_some(),
+            "authentication resolves ties by the lowest id; last-used must update that row"
+        );
+        assert!(
+            higher.last_used.is_none(),
+            "the row authentication did not select must be left untouched"
         );
     }
 }
