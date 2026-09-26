@@ -720,3 +720,125 @@ class TestLoginProtection:
         assert resp.json().get("state") == "UserLocked", (
             "admin must be lockable once exemption is disabled"
         )
+
+    def test_unauthorized_db_target_is_not_a_failed_login(
+        self,
+        processes: ProcessManager,
+        timeout,
+        shared_postgres_port,
+    ):
+        """A correct password for a database target the user has no role for
+        is denied, but it is not a failed login: retrying it must not IP-block
+        or lock the user out."""
+        import os
+        import subprocess
+
+        wg = _lp_wg(processes, ip_max=3, user_max=3)
+        url = f"https://localhost:{wg.http_port}"
+        with admin_client(url) as api:
+            target = api.create_target(
+                sdk.TargetDataRequest(
+                    name=f"postgres-{uuid4()}",
+                    require_approval=False,
+                    ticket_requests_disabled=False,
+                    ticket_require_approval=False,
+                    options=sdk.TargetOptions(
+                        sdk.TargetOptionsTargetPostgresOptions(
+                            kind="Postgres",
+                            protocol_version=sdk.PostgresProtocolVersion.ENUM_3_DOT_2,
+                            host="localhost",
+                            port=shared_postgres_port,
+                            username="user",
+                            auth=sdk.DatabaseTargetAuth(
+                                sdk.DatabaseTargetAuthDatabaseTargetPasswordAuth(
+                                    kind="Password", password="123",
+                                )
+                            ),
+                            tls=sdk.Tls(mode=sdk.TlsMode.PREFERRED, verify=False),
+                        )
+                    ),
+                )
+            )
+
+            # A user WITH the role, so we can first prove this exact setup
+            # (target, TLS, wire protocol, password) works end to end.
+            authorized_role = api.create_role(
+                sdk.RoleDataRequest(name=f"role-{uuid4()}")
+            )
+            authorized_user = api.create_user(
+                sdk.CreateUserRequest(username=f"user-{uuid4()}")
+            )
+            api.create_password_credential(
+                authorized_user.id,
+                sdk.NewPasswordCredential(password="correct_password"),
+            )
+            api.add_user_role(authorized_user.id, authorized_role.id)
+            api.add_target_role(target.id, authorized_role.id)
+
+            # The user under test has a correct password but no role grants
+            # them this target.
+            role = api.create_role(sdk.RoleDataRequest(name=f"role-{uuid4()}"))
+            user = api.create_user(sdk.CreateUserRequest(username=f"user-{uuid4()}"))
+            api.create_password_credential(
+                user.id, sdk.NewPasswordCredential(password="correct_password")
+            )
+            api.add_user_role(user.id, role.id)
+        wait_port(wg.postgres_port, recv=False)
+
+        def psql(username):
+            client = processes.start(
+                [
+                    "psql", "--user", f"{username}#{target.name}",
+                    "--host", "127.0.0.1", "--port", str(wg.postgres_port),
+                    "-c", "select 1", "db",
+                ],
+                env={**os.environ, "PGPASSWORD": "correct_password"},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            _, err = client.communicate(timeout=timeout)
+            return client.returncode, err
+
+        # Positive control: the same target/TLS/wire-protocol setup succeeds
+        # for a user who DOES hold the role. Without this, a client-side
+        # connection failure unrelated to authorization (wrong TLS mode, DB
+        # unreachable, ...) would make the denials below pass vacuously.
+        rc, err = psql(authorized_user.username)
+        assert rc == 0, (
+            f"authorized user could not connect: {err.decode(errors='replace')}"
+        )
+
+        with admin_client(url) as api:
+            before = api.get_security_status().failed_attempts_last_hour
+
+        for _ in range(5):
+            rc, err = psql(user.username)
+            assert rc != 0
+            # Denied at Postgres authentication, not by some earlier
+            # TCP/TLS failure, so these attempts did reach target
+            # authorization.
+            assert b"Authentication failed" in err, err.decode(errors="replace")
+
+        with admin_client(url) as api:
+            after = api.get_security_status().failed_attempts_last_hour
+            assert after == before, (
+                "an unauthorized-target denial with a correct password must "
+                "not be counted as a failed login attempt"
+            )
+            # Warpgate listens on `[::]` dual-stack and records blocks as
+            # `::ffff:127.0.0.1`, so `== "127.0.0.1"` could never match here
+            # regardless of whether the DB attempts got blocked. This
+            # instance is dedicated to this test, so just assert no IP got
+            # blocked at all.
+            assert api.list_blocked_ips() == [], (
+                "the DB attempts must not have IP-blocked anything"
+            )
+
+        # Same IP as the DB attempts above -- `localhost` can resolve to
+        # ::1, which would prove nothing about 127.0.0.1's IP-block state.
+        resp, _ = _post_login(
+            f"https://127.0.0.1:{wg.http_port}", user.username, "correct_password"
+        )
+        assert resp.status_code // 100 == 2, (
+            "a denied but correctly authenticated DB login must not lock the user out"
+        )
