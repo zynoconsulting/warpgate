@@ -55,15 +55,28 @@
     let showForm = $state(!!paramTarget)
     let showAllRequests = $state(false)
 
+    // A request that has been activated lives on as its ticket under "Active
+    // tickets"; it's no longer a request. Once that ticket is gone the request
+    // shows again, as history.
+    let openRequests = $derived.by(() => {
+        if (!requests) {
+            return undefined
+        }
+        const activeTicketIds = new Set(tickets?.map(t => t.id))
+        return requests.filter(
+            r => !r.ticketId || !activeTicketIds.has(r.ticketId),
+        )
+    })
+
     const REQUEST_PAGE_SIZE = 25
     let visibleRequests = $derived.by(() => {
-        if (!requests) {
+        if (!openRequests) {
             return []
         }
         if (showAllRequests) {
-            return requests
+            return openRequests
         }
-        return requests.slice(0, REQUEST_PAGE_SIZE)
+        return openRequests.slice(0, REQUEST_PAGE_SIZE)
     })
 
     let selectedTarget = $state(paramTarget ?? '')
@@ -370,9 +383,9 @@
         </ModalFooter>
     </Modal>
 
-    {#if requests}
+    {#if openRequests}
         <h4 class="mt-4">My requests</h4>
-        {#if requests.length}
+        {#if openRequests.length}
             <div class="list-group list-group-flush mb-4">
                 {#each visibleRequests as request (request.id)}
                     <div class="list-group-item gap-3">
@@ -418,9 +431,9 @@
                     </div>
                 {/each}
             </div>
-            {#if !showAllRequests && requests.length > REQUEST_PAGE_SIZE}
+            {#if !showAllRequests && openRequests.length > REQUEST_PAGE_SIZE}
                 <Button color="link" onclick={() => showAllRequests = true}>
-                    Show all {requests.length} requests
+                    Show all {openRequests.length} requests
                 </Button>
             {/if}
         {:else}
