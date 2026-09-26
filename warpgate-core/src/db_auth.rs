@@ -247,7 +247,10 @@ async fn authorize_user<T: DbAuthTransport>(
                 .await?
                 else {
                     warn!("Target {target_name} not authorized for user {username}");
-                    record_password_failure(services, username, remote_ip, T::PROTOCOL).await;
+                    // Not a failed login: the credentials were correct. Counting
+                    // it would lock out a user whose client keeps retrying a
+                    // target they lost access to, including out of the web UI.
+                    // The client sees the same denial either way.
                     transport.send_denied().await?;
                     return Ok(None);
                 };
