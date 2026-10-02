@@ -9351,6 +9351,7 @@ dependencies = [
  "poem-openapi",
  "rcgen",
  "reqwest 0.13.4",
+ "reqwest-websocket",
  "rustls",
  "sea-orm",
  "serde",
