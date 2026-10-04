@@ -1,0 +1,21 @@
+[package]
+name = "warpgate-mcp"
+version = "0.29.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+rmcp = { version = "3.5", default-features = false, features = ["server", "macros", "transport-io"] }
+rustls = { workspace = true, features = ["aws_lc_rs"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+rmcp = { version = "3.5", default-features = false, features = ["client"] }
+poem = { workspace = true, features = ["test"] }

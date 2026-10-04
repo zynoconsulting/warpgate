@@ -439,12 +439,17 @@ pub async fn deny_ticket_request(
 pub async fn list_ticket_requests(
     db: &sea_orm::DatabaseConnection,
     status_filter: Option<TicketRequestStatus>,
+    request_id: Option<Uuid>,
 ) -> Result<Vec<TicketRequest::Model>, WarpgateError> {
     let db_conn = db;
     let mut query = TicketRequest::Entity::find().order_by_desc(TicketRequest::Column::Created);
 
     if let Some(status) = status_filter {
         query = query.filter(TicketRequest::Column::Status.eq(status));
+    }
+
+    if let Some(id) = request_id {
+        query = query.filter(TicketRequest::Column::Id.eq(id));
     }
 
     Ok(query.all(db_conn).await?)

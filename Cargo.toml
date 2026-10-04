@@ -23,6 +23,7 @@ members = [
     "warpgate-protocol-vnc",
     "warpgate-desktop-ui",
     "warpgate-sso",
+    "warpgate-mcp",
     "warpgate-web",
     "warpgate-web-clients-common",
     "warpgate-web-desktop",

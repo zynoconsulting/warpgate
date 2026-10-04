@@ -888,8 +888,18 @@ impl Default for LogConfig {
     }
 }
 
+/// Post ticket request notifications linking to the normal Warpgate approval UI.
+#[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
+pub struct SlackApprovalsConfig {
+    pub channel_id: String,
+    #[schemars(with = "String")]
+    pub bot_token: Secret<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
 pub struct WarpgateConfigStore {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slack_approvals: Option<SlackApprovalsConfig>,
     #[serde(default)]
     pub sso_providers: Vec<SsoProviderConfig>,
 
@@ -932,6 +942,7 @@ impl Default for WarpgateConfigStore {
     fn default() -> Self {
         Self {
             sso_providers: vec![],
+            slack_approvals: None,
             recordings: <_>::default(),
             external_host: None,
             database_url: _default_database_url(),
