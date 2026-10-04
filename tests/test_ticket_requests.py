@@ -213,11 +213,37 @@ class TestTicketRequests:
             assert data["auto_approved_ticket_secret"] is None
             request_id = data["request"]["id"]
 
+            # A Slack deep link must select one request through the normal
+            # permission-checked admin endpoint, including after resolution.
+            details_url = f"{url}/@warpgate/admin/api/ticket-requests"
+            headers = {"X-Warpgate-Token": "token-value"}
+            response = requests.get(
+                details_url, params={"request_id": request_id},
+                headers=headers, verify=False,
+            )
+            assert response.status_code == 200
+            assert [item["id"] for item in response.json()] == [request_id]
+            unauthorized = session.get(details_url, params={"request_id": request_id})
+            assert unauthorized.status_code == 401
+
             # Admin approves via admin API — returns TicketRequest, no secret
             with admin_client(url) as api:
                 result = api.approve_ticket_request(request_id)
                 assert result.status == "Approved"
                 assert result.ticket_id is None  # no ticket yet
+
+            response = requests.get(
+                details_url, params={"request_id": request_id},
+                headers=headers, verify=False,
+            )
+            assert response.status_code == 200
+            assert response.json()[0]["status"] == "Approved"
+            response = requests.get(
+                details_url, params={"request_id": request_id, "status": "Pending"},
+                headers=headers, verify=False,
+            )
+            assert response.status_code == 200
+            assert response.json() == []
 
             # User activates the approved request via gateway API
             resp = session.post(

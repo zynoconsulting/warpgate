@@ -24,7 +24,8 @@ WORKDIR /opt/warpgate
 RUN just npm ci \
     && just openapi \
     && just npm run build \
-    && cargo build --features mysql,postgres,rdp-openssl-tls --release
+    && cargo build --features mysql,postgres,rdp-openssl-tls --release \
+    && cargo build -p warpgate-mcp --release
 
 ARG USER_ID=1000
 RUN adduser warpgate --disabled-password --gecos "" --uid ${USER_ID} --home /data --shell /usr/sbin/nologin \
@@ -38,6 +39,7 @@ COPY --from=build /etc/passwd /etc/passwd
 COPY --from=build /etc/group /etc/group
 COPY --from=build --chown=warpgate:warpgate /data /data
 COPY --from=build /opt/warpgate/target/release/warpgate /usr/local/bin/warpgate
+COPY --from=build /opt/warpgate/target/release/warpgate-mcp /usr/local/bin/warpgate-mcp
 
 VOLUME /data
 
