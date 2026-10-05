@@ -31,19 +31,24 @@ Warpgate attempts one asynchronous post when a pending request is created. Deliv
 
 ## Run the MCP adapter
 
-Build the standalone stdio adapter:
+The stdio adapter is a separate TypeScript/npm package requiring Node.js 22 or newer. It uses the existing HTTP APIs and adds no Cargo dependencies or Docker build steps.
+
+The package is not published to npm yet. Build a runnable package from this checkout:
 
 ```bash
-cargo build -p warpgate-mcp --release
+cd warpgate-mcp
+npm ci
+npm pack
 ```
 
-The Docker image also includes `warpgate-mcp`. Configure your MCP client to launch the binary with the Warpgate origin and an existing requester user API token:
+`npm pack` compiles TypeScript and creates `zynoconsulting-warpgate-mcp-0.1.0.tgz`. Configure your MCP client to run that package through `npx`, with the Warpgate origin and an existing requester user API token:
 
 ```json
 {
   "mcpServers": {
     "warpgate": {
-      "command": "/path/to/warpgate-mcp",
+      "command": "npx",
+      "args": ["--yes", "--package", "/absolute/path/to/zynoconsulting-warpgate-mcp-0.1.0.tgz", "warpgate-mcp"],
       "env": {
         "WARPGATE_URL": "https://warpgate.example",
         "WARPGATE_TOKEN": "your-requester-user-api-token"
@@ -52,6 +57,8 @@ The Docker image also includes `warpgate-mcp`. Configure your MCP client to laun
   }
 }
 ```
+
+After npm publication, simplify `args` to `["--yes", "@zynoconsulting/warpgate-mcp@0.1.0"]`. The installed package includes compiled JavaScript; consumers need no Rust or TypeScript compiler. For local development, run `npm run build` and then `npm start` inside `warpgate-mcp` with the same environment variables. `npm test` exercises the stdio tools against a local mock HTTP API.
 
 Use an origin without a path, query, or fragment. HTTPS is required, with HTTP allowed for loopback development. Redirects are disabled to avoid forwarding the token to another origin. The normal API token expiry, requester identity, visibility, and authorization rules apply. A global admin token does not represent a requester user.
 

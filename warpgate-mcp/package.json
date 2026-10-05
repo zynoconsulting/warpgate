@@ -1,0 +1,37 @@
+{
+  "name": "@zynoconsulting/warpgate-mcp",
+  "version": "0.1.0",
+  "description": "Request, check, and activate Warpgate access tickets through MCP",
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zynoconsulting/warpgate.git",
+    "directory": "warpgate-mcp"
+  },
+  "bin": {
+    "warpgate-mcp": "dist/main.js"
+  },
+  "files": ["dist"],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/main.js",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.3.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "^2.3.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3"
+  }
+}
