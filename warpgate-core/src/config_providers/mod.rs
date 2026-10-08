@@ -19,13 +19,18 @@ use warpgate_common::auth::{
 };
 use warpgate_common::helpers::hash::hash_secret;
 use warpgate_common::{
-    Protocol, Secret, SpecificTarget, Target, TargetOptions, TargetOptionsVariant, User,
-    WarpgateError,
+    ApiTokenPermissions, Protocol, Secret, SpecificTarget, Target, TargetOptions,
+    TargetOptionsVariant, User, WarpgateError,
 };
 use warpgate_db_entities as e;
 use warpgate_sso::SsoProviderConfig;
 
 use crate::login_protection::LoginProtectionService;
+
+pub struct ValidatedApiToken {
+    pub user: User,
+    pub permissions: ApiTokenPermissions,
+}
 
 #[enum_dispatch]
 pub enum ConfigProviderEnum {
@@ -97,7 +102,10 @@ pub trait ConfigProvider {
         credential: Option<AuthCredential>,
     ) -> Result<(), WarpgateError>;
 
-    async fn validate_api_token(&self, token: &str) -> Result<Option<User>, WarpgateError>;
+    async fn validate_api_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<ValidatedApiToken>, WarpgateError>;
 }
 
 /// Proof that a user authenticated for a given protocol, and so may be handed to

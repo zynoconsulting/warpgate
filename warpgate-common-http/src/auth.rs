@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 use warpgate_common::auth::AuthStateUserInfo;
-use warpgate_common::{Protocol, WarpgateError};
+use warpgate_common::{ApiTokenPermissions, Protocol, WarpgateError};
 use warpgate_core::AuthorizedIdentity;
 use warpgate_db_entities::Parameters;
 
@@ -91,6 +91,8 @@ pub enum RequestAuthorization {
     UserToken {
         user_id: Uuid,
         username: String,
+        #[serde(default)]
+        permissions: ApiTokenPermissions,
     },
     AdminToken,
     /// Auth between cluster peers
@@ -226,6 +228,20 @@ impl FullUserAuthorization {
 }
 
 impl RequestAuthorization {
+    pub const fn allows_user_api(&self) -> bool {
+        match self {
+            Self::UserToken { permissions, .. } => permissions.user_api,
+            _ => true,
+        }
+    }
+
+    pub const fn allows_admin_api(&self) -> bool {
+        match self {
+            Self::UserToken { permissions, .. } => permissions.admin_api,
+            _ => true,
+        }
+    }
+
     pub const fn is_cluster_peer(&self) -> bool {
         matches!(self, Self::ClusterToken)
     }
@@ -253,12 +269,12 @@ impl RequestAuthorization {
     pub fn as_full_user(&self) -> Option<FullUserAuthorization> {
         match self {
             Self::Session(SessionAuthorization::User { user_id, username })
-            | Self::UserToken { user_id, username } => {
-                Some(FullUserAuthorization(AuthStateUserInfo {
-                    id: *user_id,
-                    username: username.clone(),
-                }))
-            }
+            | Self::UserToken {
+                user_id, username, ..
+            } => Some(FullUserAuthorization(AuthStateUserInfo {
+                id: *user_id,
+                username: username.clone(),
+            })),
             Self::Session(SessionAuthorization::Ticket { .. })
             | Self::AdminToken
             | Self::ClusterToken => None,
@@ -300,6 +316,7 @@ mod tests {
         let token = RequestAuthorization::UserToken {
             user_id: Uuid::nil(),
             username: "alice".into(),
+            permissions: warpgate_common::ApiTokenPermissions::default(),
         };
         assert!(token.as_full_user().is_some());
 

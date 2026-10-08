@@ -36,11 +36,16 @@
         lastCreatedSecret = undefined
     }
 
-    async function createToken(label: string, expiry: Date) {
+    async function createToken(
+        label: string,
+        expiry: Date,
+        userApi: boolean,
+        adminApi: boolean,
+    ) {
         try {
             error = undefined
             const { secret, token } = await api.createApiToken({
-                newApiToken: { label, expiry },
+                newApiToken: { label, expiry, userApi, adminApi },
             })
             lastCreatedSecret = secret
             tokens = [...tokens, token]
@@ -90,6 +95,12 @@
                 <div class="list-group-item d-flex align-items-center pr-0">
                     <Fa fw icon={faKey} />
                     <span class="label ms-3">{token.label}</span>
+                    {#if token.userApi}
+                        <Badge color="secondary" class="ms-2">User API</Badge>
+                    {/if}
+                    {#if token.adminApi}
+                        <Badge color="secondary" class="ms-2">Admin API</Badge>
+                    {/if}
                     {#if token.expiry.getTime() < now}
                         <Badge color="danger" class="ms-2">Expired</Badge>
                     {:else}

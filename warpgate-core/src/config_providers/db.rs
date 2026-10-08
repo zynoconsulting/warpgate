@@ -17,13 +17,13 @@ use warpgate_common::auth::{
 use warpgate_common::helpers::hash::{hash_secret, verify_password_hash};
 use warpgate_common::helpers::otp::verify_totp;
 use warpgate_common::{
-    Protocol, Target, User, UserAuthCredential, UserPublicKeyCredential,
+    ApiTokenPermissions, Protocol, Target, User, UserAuthCredential, UserPublicKeyCredential,
     UserRequireCredentialsPolicy, UserSsoCredential, WarpgateError,
 };
 use warpgate_db_entities as entities;
 use warpgate_sso::SsoProviderConfig;
 
-use super::ConfigProvider;
+use super::{ConfigProvider, ValidatedApiToken};
 
 pub struct DatabaseConfigProvider {
     db: DatabaseConnection,
@@ -1034,7 +1034,10 @@ impl ConfigProvider for DatabaseConfigProvider {
         Ok(())
     }
 
-    async fn validate_api_token(&self, token: &str) -> Result<Option<User>, WarpgateError> {
+    async fn validate_api_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<ValidatedApiToken>, WarpgateError> {
         let db = &self.db;
         let Some(api_token) = entities::ApiToken::Entity::find()
             .filter(
@@ -1058,7 +1061,13 @@ impl ConfigProvider for DatabaseConfigProvider {
             ));
         };
 
-        Ok(Some(user.try_into()?))
+        Ok(Some(ValidatedApiToken {
+            user: user.try_into()?,
+            permissions: ApiTokenPermissions {
+                user_api: api_token.user_api,
+                admin_api: api_token.admin_api,
+            },
+        }))
     }
 }
 

@@ -2,7 +2,7 @@
   "openapi": "3.0.0",
   "info": {
     "title": "Warpgate HTTP proxy",
-    "version": "v0.28.5-14-g4f033556-modified"
+    "version": "v0.29.0-87-g233a6fb6-modified"
   },
   "servers": [
     {
@@ -933,6 +933,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": ""
           },
           "401": {
             "description": ""
@@ -1952,7 +1955,9 @@
           "id",
           "label",
           "created",
-          "expiry"
+          "expiry",
+          "user_api",
+          "admin_api"
         ],
         "properties": {
           "id": {
@@ -1969,6 +1974,12 @@
           "expiry": {
             "type": "string",
             "format": "date-time"
+          },
+          "user_api": {
+            "type": "boolean"
+          },
+          "admin_api": {
+            "type": "boolean"
           }
         }
       },
@@ -2342,6 +2353,14 @@
           "expiry": {
             "type": "string",
             "format": "date-time"
+          },
+          "user_api": {
+            "type": "boolean",
+            "default": true
+          },
+          "admin_api": {
+            "type": "boolean",
+            "default": true
           }
         }
       },
