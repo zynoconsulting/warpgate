@@ -16,7 +16,12 @@
 
     interface Props {
         isOpen: boolean
-        create: (label: string, expiry: Date) => void
+        create: (
+            label: string,
+            expiry: Date,
+            userApi: boolean,
+            adminApi: boolean,
+        ) => void
         initialLabel?: string
         initialExpiryMs?: number
     }
@@ -61,9 +66,13 @@
     )
     let field: HTMLInputElement | undefined = $state()
     let validated = $state(false)
+    let userApi = $state(true)
+    let adminApi = $state(true)
+    let hasApiAccess = $derived(userApi || adminApi)
 
     function _save() {
-        create(label, new Date(expiry))
+        if (!hasApiAccess) return
+        create(label, new Date(expiry), userApi, adminApi)
         _cancel()
     }
 
@@ -100,11 +109,40 @@
                     </small>
                 {/if}
             </FormGroup>
+            <fieldset class="mt-3">
+                <legend class="fs-6">API access</legend>
+                <label class="form-check">
+                    <input
+                        class="form-check-input"
+                        type="checkbox"
+                        bind:checked={userApi}
+                    >
+                    <span class="form-check-label">User API</span>
+                </label>
+                <label class="form-check">
+                    <input
+                        class="form-check-input"
+                        type="checkbox"
+                        bind:checked={adminApi}
+                    >
+                    <span class="form-check-label">Admin API</span>
+                </label>
+                <small class="text-muted"
+                    >Access follows your existing user and admin
+                    permissions.</small
+                >
+                {#if !hasApiAccess}
+                    <div class="text-danger" role="alert">
+                        Enable at least one API.
+                    </div>
+                {/if}
+            </fieldset>
         </ModalBody>
         <ModalFooter>
             <Button
                 color="primary"
                 class="modal-button"
+                disabled={!hasApiAccess}
                 on:click={() => (validated = true)}
             >
                 Create

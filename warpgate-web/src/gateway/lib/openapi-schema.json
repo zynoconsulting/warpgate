@@ -969,6 +969,9 @@
               }
             }
           },
+          "403": {
+            "description": ""
+          },
           "401": {
             "description": ""
           }
@@ -1981,7 +1984,9 @@
           "id",
           "label",
           "created",
-          "expiry"
+          "expiry",
+          "user_api",
+          "admin_api"
         ],
         "properties": {
           "id": {
@@ -1998,6 +2003,12 @@
           "expiry": {
             "type": "string",
             "format": "date-time"
+          },
+          "user_api": {
+            "type": "boolean"
+          },
+          "admin_api": {
+            "type": "boolean"
           }
         }
       },
@@ -2381,6 +2392,14 @@
           "expiry": {
             "type": "string",
             "format": "date-time"
+          },
+          "user_api": {
+            "type": "boolean",
+            "default": true
+          },
+          "admin_api": {
+            "type": "boolean",
+            "default": true
           }
         }
       },
@@ -2947,7 +2966,7 @@
     "securitySchemes": {
       "ClusterSecurityScheme": {
         "type": "apiKey",
-        "description": "Requests forwarded by a cluster peer are authenticated by the peer's TLS\nclient certificate at the listener (plus the forwarded user identity\nresolved into the request authorization — see\n`cluster_request_authorization`). The node id header only lets this scheme\nfire: the checker reads the context that `inject_request_authorization`\nattaches, so a header alone never authenticates.",
+        "description": "Requests forwarded by a cluster peer are authenticated by the peer's TLS\nclient certificate at the listener (plus the forwarded user identity\nresolved into the request authorization \u2014 see\n`cluster_request_authorization`). The node id header only lets this scheme\nfire: the checker reads the context that `inject_request_authorization`\nattaches, so a header alone never authenticates.",
         "name": "x-warpgate-cluster-node",
         "in": "header"
       },
