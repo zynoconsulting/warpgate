@@ -15,6 +15,9 @@ use warpgate_db_entities::{AdminRole, User};
 pub async fn admin_permission_set(
     ctx: &warpgate_common_http::AuthenticatedRequestContext,
 ) -> Result<AdminPermissionSet, WarpgateError> {
+    if !ctx.auth.allows_admin_api() {
+        return Ok(AdminPermissionSet::none());
+    }
     if matches!(ctx.auth, RequestAuthorization::AdminToken) {
         return Ok(AdminPermissionSet::all());
     }

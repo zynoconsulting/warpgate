@@ -12,6 +12,8 @@ pub struct Model {
     pub user_id: Uuid,
     pub label: String,
     pub secret_hash: String,
+    pub user_api: bool,
+    pub admin_api: bool,
     pub created: OffsetDateTime,
     pub expiry: OffsetDateTime,
 }

@@ -6,6 +6,7 @@ use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 use warpgate_common::WarpgateError;
 use warpgate_common::helpers::hash::{generate_ticket_secret, hash_secret};
+use warpgate_common_http::RequestAuthorization;
 use warpgate_common_http::errors::bad_request;
 use warpgate_db_entities::ApiToken;
 
@@ -26,6 +27,14 @@ enum GetApiTokensResponse {
 struct NewApiToken {
     label: String,
     expiry: OffsetDateTime,
+    #[oai(default = "api_enabled_by_default")]
+    user_api: bool,
+    #[oai(default = "api_enabled_by_default")]
+    admin_api: bool,
+}
+
+const fn api_enabled_by_default() -> bool {
+    true
 }
 
 #[derive(Object)]
@@ -34,6 +43,8 @@ struct ExistingApiToken {
     label: String,
     created: OffsetDateTime,
     expiry: OffsetDateTime,
+    user_api: bool,
+    admin_api: bool,
 }
 
 impl From<ApiToken::Model> for ExistingApiToken {
@@ -43,6 +54,8 @@ impl From<ApiToken::Model> for ExistingApiToken {
             label: token.label,
             created: token.created,
             expiry: token.expiry,
+            user_api: token.user_api,
+            admin_api: token.admin_api,
         }
     }
 }
@@ -59,6 +72,8 @@ enum CreateApiTokenResponse {
     Created(Json<TokenAndSecret>),
     #[oai(status = 400)]
     BadRequest(Json<String>),
+    #[oai(status = 403)]
+    Forbidden,
     #[oai(status = 401)]
     Unauthorized,
 }
@@ -121,6 +136,19 @@ impl Api {
             return Ok(CreateApiTokenResponse::Unauthorized);
         };
 
+        if !body.user_api && !body.admin_api {
+            return Ok(CreateApiTokenResponse::BadRequest(bad_request(
+                "Enable at least one API",
+            )));
+        }
+        // A token must not mint a replacement that restores its disabled APIs.
+        if let RequestAuthorization::UserToken { permissions, .. } = auth
+            && ((body.user_api && !permissions.user_api)
+                || (body.admin_api && !permissions.admin_api))
+        {
+            return Ok(CreateApiTokenResponse::Forbidden);
+        }
+
         let parameters = ctx.parameters().await?;
         if let Some(max_seconds) = parameters.max_api_token_duration_seconds {
             let max_expiry = OffsetDateTime::now_utc() + Duration::seconds(max_seconds);
@@ -139,6 +167,8 @@ impl Api {
             expiry: Set(body.expiry),
             label: Set(body.label.clone()),
             secret_hash: Set(hash_secret(secret.expose_secret())),
+            user_api: Set(body.user_api),
+            admin_api: Set(body.admin_api),
         }
         .insert(db)
         .await

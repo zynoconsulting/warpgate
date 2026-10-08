@@ -27,7 +27,7 @@ use warpgate_common_http::{
     AuthenticatedRequestContext, RequestAuthorization, SessionAuthorization,
     X_WARPGATE_CLUSTER_IDENTITY, X_WARPGATE_TOKEN, is_cluster_peer_request,
 };
-use warpgate_core::{ConfigProvider, vet_credential_bearer};
+use warpgate_core::{ConfigProvider, ValidatedApiToken, vet_credential_bearer};
 use warpgate_db_entities::User;
 use warpgate_sso::WarpgateIdToken;
 
@@ -461,7 +461,10 @@ pub async fn authorize_session(
     // a same-user step-up re-auth (web_auth_max_age_seconds) or an SSO
     // re-login has no stale grant to protect against, and detaching there
     // would needlessly kill this browser's already-open websockets/streams.
-    if matches!(session.get_auth(), Some(SessionAuthorization::Ticket { .. })) {
+    if matches!(
+        session.get_auth(),
+        Some(SessionAuthorization::Ticket { .. })
+    ) {
         session_middleware.lock().await.remove_session(session);
     }
 
@@ -508,7 +511,7 @@ async fn user_for_api_token(
     req: &Request,
     ctx: &UnauthenticatedRequestContext,
     token: &str,
-) -> Result<Option<warpgate_common::User>, WarpgateError> {
+) -> Result<Option<ValidatedApiToken>, WarpgateError> {
     let services = ctx.services();
     let remote_ip = get_client_ip_addr(req, services).await;
 
@@ -525,15 +528,15 @@ async fn user_for_api_token(
         return Ok(None);
     }
 
-    let Some(user) = services.config_provider.validate_api_token(token).await? else {
+    let Some(validated) = services.config_provider.validate_api_token(token).await? else {
         return Ok(None);
     };
 
-    if !vet_credential_bearer(&services.login_protection, &user, remote_ip).await? {
+    if !vet_credential_bearer(&services.login_protection, &validated.user, remote_ip).await? {
         return Ok(None);
     }
 
-    Ok(Some(user))
+    Ok(Some(validated))
 }
 
 pub async fn inject_request_authorization<E: Endpoint + 'static>(
@@ -617,10 +620,11 @@ pub async fn inject_request_authorization<E: Endpoint + 'static>(
             })
         {
             Some(RequestAuthorization::AdminToken)
-        } else if let Some(user) = user_for_api_token(&req, &ctx, token_from_header).await? {
+        } else if let Some(validated) = user_for_api_token(&req, &ctx, token_from_header).await? {
             Some(RequestAuthorization::UserToken {
-                user_id: user.id,
-                username: user.username,
+                user_id: validated.user.id,
+                username: validated.user.username,
+                permissions: validated.permissions,
             })
         } else {
             None
@@ -630,6 +634,27 @@ pub async fn inject_request_authorization<E: Endpoint + 'static>(
     };
 
     if let Some(auth) = auth {
+        // Check before dispatch/cluster forwarding, including streams and target
+        // proxy routes that do not use the OpenAPI authentication checker.
+        let admin_api = ["/@warpgate/admin/api", "/_warpgate/admin/api"]
+            .iter()
+            .any(|prefix| {
+                req.original_uri()
+                    .path()
+                    .strip_prefix(prefix)
+                    .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+            });
+        let allowed = if admin_api {
+            auth.allows_admin_api()
+        } else {
+            auth.allows_user_api()
+        };
+        if !allowed {
+            return Err(poem::Error::from_string(
+                "API access is disabled for this token",
+                StatusCode::FORBIDDEN,
+            ));
+        }
         // additional span to include the session_username for token requests
         let span = match &auth {
             RequestAuthorization::UserToken { username, .. } => {
