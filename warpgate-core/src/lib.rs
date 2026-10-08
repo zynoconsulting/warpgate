@@ -16,6 +16,7 @@ pub(crate) mod helpers;
 mod listener_status;
 pub mod logging;
 pub mod login_protection;
+pub mod notifications;
 mod protocols;
 pub mod rate_limiting;
 pub mod recordings;
