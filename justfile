@@ -3,6 +3,9 @@ projects := "warpgate warpgate-admin warpgate-common warpgate-db-entities warpga
 run *ARGS='run':
     RUST_BACKTRACE=1 cargo run --all-features -- --config config.yaml {{ARGS}}
 
+mcp:
+    cd warpgate-mcp && npm start
+
 run-release *ARGS='run':
     RUST_BACKTRACE=1 cargo run --all-features --release -- --config config.yaml {{ARGS}}
 
