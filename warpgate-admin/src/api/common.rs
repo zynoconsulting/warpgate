@@ -21,6 +21,9 @@ pub fn is_unique_violation(err: &DbErr) -> bool {
 pub async fn admin_permission_set(
     ctx: &warpgate_common_http::AuthenticatedRequestContext,
 ) -> Result<AdminPermissionSet, WarpgateError> {
+    if !ctx.auth.allows_admin_api() {
+        return Ok(AdminPermissionSet::none());
+    }
     if matches!(ctx.auth, RequestAuthorization::AdminToken) {
         return Ok(AdminPermissionSet::all());
     }

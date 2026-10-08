@@ -449,8 +449,14 @@ async fn authenticate(
 ) -> poem::Result<Option<(User, Option<AuthCredential>)>> {
     // Bearer token authentication (API tokens, then OIDC ID tokens).
     if let Some(token) = authorization_token(req, "Bearer") {
-        if let Ok(Some(user)) = services.config_provider.validate_api_token(token).await {
-            return Ok(Some((user, None)));
+        if let Ok(Some(validated)) = services.config_provider.validate_api_token(token).await {
+            if !validated.permissions.user_api {
+                return Err(poem::Error::from_string(
+                    "User API access is disabled for this token",
+                    poem::http::StatusCode::FORBIDDEN,
+                ));
+            }
+            return Ok(Some((validated.user, None)));
         }
 
         // API token did not match — try OIDC ID token validation against any SSO

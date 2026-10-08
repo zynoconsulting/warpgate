@@ -5,7 +5,9 @@ use warpgate_common_http::AuthenticatedRequestContext;
 
 #[allow(clippy::unused_async)]
 async fn authenticated_context(req: &Request, _key: ApiKey) -> Option<AuthenticatedRequestContext> {
-    req.data::<AuthenticatedRequestContext>().cloned()
+    req.data::<AuthenticatedRequestContext>()
+        .filter(|ctx| ctx.auth.allows_user_api())
+        .cloned()
 }
 
 #[derive(SecurityScheme)]
