@@ -1,6 +1,7 @@
 use poem_openapi::param::Query;
 use poem_openapi::payload::Json;
 use poem_openapi::{ApiResponse, OpenApi};
+use uuid::Uuid;
 use warpgate_common::{AdminPermission, WarpgateError};
 use warpgate_core::ticket_requests::list_ticket_requests;
 use warpgate_db_entities::TicketRequest::TicketRequestStatus;
@@ -29,10 +30,11 @@ impl Api {
         &self,
         admin: AdminContext,
         status: Query<Option<TicketRequestStatus>>,
+        request_id: Query<Option<Uuid>>,
     ) -> Result<GetTicketRequestsResponse, WarpgateError> {
         admin.require(AdminPermission::TicketRequestsManage)?;
 
-        let requests = list_ticket_requests(&admin.services().db, status.0).await?;
+        let requests = list_ticket_requests(&admin.services().db, status.0, request_id.0).await?;
         let requests = batch_resolve_ticket_request_names(&admin.services().db, requests).await?;
         Ok(GetTicketRequestsResponse::Ok(Json(requests)))
     }

@@ -888,8 +888,30 @@ impl Default for LogConfig {
     }
 }
 
+/// Optional providers for ticket request notifications.
+#[derive(Debug, Default, Deserialize, Serialize, Clone, JsonSchema)]
+pub struct NotificationsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slack: Option<SlackNotificationsConfig>,
+}
+
+impl NotificationsConfig {
+    pub const fn is_empty(&self) -> bool {
+        self.slack.is_none()
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
+pub struct SlackNotificationsConfig {
+    pub channel_id: String,
+    #[schemars(with = "String")]
+    pub bot_token: Secret<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
 pub struct WarpgateConfigStore {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notifications: Option<NotificationsConfig>,
     #[serde(default)]
     pub sso_providers: Vec<SsoProviderConfig>,
 
@@ -932,6 +954,7 @@ impl Default for WarpgateConfigStore {
     fn default() -> Self {
         Self {
             sso_providers: vec![],
+            notifications: None,
             recordings: <_>::default(),
             external_host: None,
             database_url: _default_database_url(),

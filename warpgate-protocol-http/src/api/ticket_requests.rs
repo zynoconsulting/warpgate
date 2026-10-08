@@ -214,11 +214,19 @@ impl Api {
         .await;
 
         match result {
-            Ok(result) => Ok(CreateTicketRequestResponse::Created(Json(CreatedRequest {
-                request: result.request,
-                target: result.target.try_into()?,
-                auto_approved_ticket_secret: result.auto_approved_secret,
-            }))),
+            Ok(result) => {
+                warpgate_core::notifications::notify_ticket_request(
+                    ctx.services(),
+                    &user_model.username,
+                    &result.request,
+                    &result.target,
+                );
+                Ok(CreateTicketRequestResponse::Created(Json(CreatedRequest {
+                    request: result.request,
+                    target: result.target.try_into()?,
+                    auto_approved_ticket_secret: result.auto_approved_secret,
+                })))
+            }
             Err(CreateTicketRequestError::InvalidInput(msg)) => {
                 Ok(CreateTicketRequestResponse::BadRequest(bad_request(msg)))
             }

@@ -22,6 +22,7 @@
         api,
         type SessionApprovalItem,
         type TicketRequest,
+        TicketRequestStatus,
     } from 'admin/lib/api'
     import { adminPermissions } from 'admin/lib/store'
     import AsyncButton from 'common/AsyncButton.svelte'
@@ -35,6 +36,11 @@
     import { errorStatus, stringifyError } from 'common/errors'
     import RelativeDate from 'common/RelativeDate.svelte'
     import Fa from 'svelte-fa'
+    import { link, router } from 'svelte-spa-router'
+
+    let selectedTicketId = $derived(
+        new URLSearchParams(router.querystring ?? '').get('ticket_request'),
+    )
 
     // One inbox entry, whichever kind of request produced it. `at` is the
     // shared sort key so both kinds interleave chronologically, and `key`
@@ -86,17 +92,34 @@
 
     // Swallows the error so a failed background refresh leaves the last known
     // list on screen instead of blanking the inbox.
-    async function refresh() {
+    async function refresh(ticketId = selectedTicketId) {
         try {
-            const result = await loadPendingRequests({
-                canSeeSessions,
-                canManageTickets,
-            })
-            sessions = result.sessions
-            tickets = result.tickets
+            let nextSessions: SessionApprovalItem[] = []
+            let nextTickets: TicketRequest[] = []
+            if (ticketId) {
+                // Include resolved requests: an old notification link still shows the
+                // actual decision, using the existing permission-checked API.
+                if (canManageTickets) {
+                    nextTickets = await api.getTicketRequests({
+                        requestId: ticketId,
+                    })
+                }
+            } else {
+                const result = await loadPendingRequests({
+                    canSeeSessions,
+                    canManageTickets,
+                })
+                nextSessions = result.sessions
+                nextTickets = result.tickets
+            }
+            if (ticketId !== selectedTicketId) return
+            sessions = nextSessions
+            tickets = nextTickets
             loadError = undefined
         } catch (err) {
-            loadError = await stringifyError(err)
+            const message = await stringifyError(err)
+            if (ticketId !== selectedTicketId) return
+            loadError = message
         }
         loaded = true
     }
@@ -104,11 +127,21 @@
     // Returned from the effect, not registered with onDestroy: re-running the
     // effect must tear down the previous watch, which onDestroy (scoped to the
     // component) would defer until unmount, leaking a socket per run.
-    $effect(() =>
-        watchPendingRequests({ canSeeSessions, canManageTickets }, () => {
-            void refresh()
-        }),
-    )
+    $effect(() => {
+        const ticketId = selectedTicketId
+        loaded = false
+        sessions = []
+        tickets = []
+        loadError = undefined
+        actionError = undefined
+        denyModalRequest = undefined
+        return watchPendingRequests(
+            { canSeeSessions: canSeeSessions && !ticketId, canManageTickets },
+            () => {
+                void refresh(ticketId)
+            },
+        )
+    })
 
     // A 404 means someone else already resolved it, or the held session gave
     // up waiting — the entry is simply gone. It answers with no body, so it
@@ -184,10 +217,13 @@
 </script>
 
 <div class="page-summary-bar">
-    <h1>requests</h1>
+    <h1>{selectedTicketId ? 'Ticket request' : 'requests'}</h1>
+    {#if selectedTicketId}
+        <a use:link href="/status/requests" class="ms-auto">All requests</a>
+    {/if}
 </div>
 
-{#if !canSeeSessions && !canManageTickets}
+{#if selectedTicketId ? !canManageTickets : !canSeeSessions && !canManageTickets}
     <Alert color="warning">You have no permission to view requests.</Alert>
 {:else}
     {#if error}
@@ -198,7 +234,9 @@
         <DelayedSpinner />
     {:else}
         {#if !entries.length}
-            <EmptyState title="Nothing right now" />
+            <EmptyState
+                title={selectedTicketId ? 'Ticket request not found' : 'Nothing right now'}
+            />
         {/if}
 
         <div class="list-group list-group-flush">
@@ -304,6 +342,24 @@
                                 </strong>
                             </div>
                             <div class="small text-muted">
+                                {#if selectedTicketId}
+                                    <div>Request: {entry.ticket.id}</div>
+                                    <div>
+                                        Status: {entry.ticket.status}
+                                        {#if entry.ticket.resolvedByUserId}
+                                            by
+                                            {entry.ticket.resolvedByUsername ?? entry.ticket.resolvedByUserId}
+                                        {/if}
+                                    </div>
+                                    {#if entry.ticket.status === TicketRequestStatus.Approved && !entry.ticket.ticketId}
+                                        <div>Awaiting requester activation</div>
+                                    {/if}
+                                    {#if entry.ticket.denyReason}
+                                        <div>
+                                            Reason: {entry.ticket.denyReason}
+                                        </div>
+                                    {/if}
+                                {/if}
                                 {#if entry.ticket.requestedDurationSeconds}
                                     valid for
                                     {formatDurationAsHumantime(
@@ -318,24 +374,26 @@
                             </div>
                         </div>
 
-                        <ButtonGroup class="ms-auto">
-                            <AsyncButton
-                                color="success"
-                                click={() => approveTicket(entry.ticket)}
-                            >
-                                Approve
-                            </AsyncButton>
-                            <Button
-                                color="danger"
-                                onclick={() => {
+                        {#if entry.ticket.status === TicketRequestStatus.Pending}
+                            <ButtonGroup class="ms-auto">
+                                <AsyncButton
+                                    color="success"
+                                    click={() => approveTicket(entry.ticket)}
+                                >
+                                    Approve
+                                </AsyncButton>
+                                <Button
+                                    color="danger"
+                                    onclick={() => {
                                     denyModalRequest = entry.ticket
                                     denyReason = ''
                                     denyError = undefined
                                 }}
-                            >
-                                Reject
-                            </Button>
-                        </ButtonGroup>
+                                >
+                                    Reject
+                                </Button>
+                            </ButtonGroup>
+                        {/if}
                     {/if}
                 </div>
             {/each}
