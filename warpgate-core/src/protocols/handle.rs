@@ -279,8 +279,15 @@ impl WarpgateServerHandle {
             nudges,
         };
         tokio::spawn(
-            crate::access_watch::watch(self.db.clone(), grant, weak_handle, token, settings, deadline)
-                .instrument(span),
+            crate::access_watch::watch(
+                self.db.clone(),
+                grant,
+                weak_handle,
+                token,
+                settings,
+                deadline,
+            )
+            .instrument(span),
         );
     }
 
