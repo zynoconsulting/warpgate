@@ -624,7 +624,8 @@ async fn _handle_websocket_request_inner(
                 ws_protocols.join(", "),
             );
         }
-        let client_response = closed.run_until_cancelled(upgrade_request.send())
+        let client_response = closed
+            .run_until_cancelled(upgrade_request.send())
             .await
             .context("Session closed while upgrading the Kubernetes websocket")?
             .context("sending websocket request to Kubernetes API")?;
@@ -653,7 +654,8 @@ async fn _handle_websocket_request_inner(
 
         check_upstream_handshake(client_response.headers(), &key, &ws_protocols)
             .context("negotiating websocket connection with Kubernetes")?;
-        let upgraded = closed.run_until_cancelled(client_response.upgrade())
+        let upgraded = closed
+            .run_until_cancelled(client_response.upgrade())
             .await
             .context("Session closed while negotiating the Kubernetes websocket")?
             .context("negotiating websocket connection with Kubernetes")?;
