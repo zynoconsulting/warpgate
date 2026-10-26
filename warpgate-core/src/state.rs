@@ -44,7 +44,8 @@ impl State {
         node_id: NodeId,
     ) -> Arc<Mutex<Self>> {
         let sender = broadcast::channel(2).0;
-        let (access_watch_interval, access_watch_unconfirmed_limit) = access_watch::default_timing();
+        let (access_watch_interval, access_watch_unconfirmed_limit) =
+            access_watch::default_timing();
         Arc::new(Mutex::new(Self {
             user_sessions: HashMap::new(),
             db: db.clone(),
@@ -62,7 +63,8 @@ impl State {
     /// revoke closes its sessions promptly rather than up to one interval
     /// late.
     pub fn nudge_access_watchers(&self) {
-        self.access_watch_nudges.send_modify(|n| *n = n.wrapping_add(1));
+        self.access_watch_nudges
+            .send_modify(|n| *n = n.wrapping_add(1));
     }
 
     /// The sender behind [`Self::nudge_access_watchers`], for a caller (the
@@ -76,7 +78,11 @@ impl State {
     /// Speeds up access-watch polling for a test, so it does not have to wait
     /// out the production interval.
     #[cfg(test)]
-    pub(crate) fn set_access_watch_timing(&mut self, interval: Duration, unconfirmed_limit: Duration) {
+    pub(crate) fn set_access_watch_timing(
+        &mut self,
+        interval: Duration,
+        unconfirmed_limit: Duration,
+    ) {
         self.access_watch_interval = interval;
         self.access_watch_unconfirmed_limit = unconfirmed_limit;
     }
@@ -1135,7 +1141,8 @@ mod tests {
     /// admitting it and relying on the watcher to close it moments later.
     #[tokio::test]
     async fn admission_refuses_revoked_ticket_and_opens_no_row() {
-        let (db, state) = state_with_watch_timing(Duration::from_secs(3600), Duration::from_secs(3600)).await;
+        let (db, state) =
+            state_with_watch_timing(Duration::from_secs(3600), Duration::from_secs(3600)).await;
         let access_target = target();
         let (user_info, ticket_id) = insert_ticket(&db, &access_target, None, None).await;
         warpgate_db_entities::Ticket::Entity::delete_by_id(ticket_id)
@@ -1195,7 +1202,8 @@ mod tests {
     /// already passed.
     #[tokio::test]
     async fn admission_refuses_expired_ticket() {
-        let (db, state) = state_with_watch_timing(Duration::from_secs(3600), Duration::from_secs(3600)).await;
+        let (db, state) =
+            state_with_watch_timing(Duration::from_secs(3600), Duration::from_secs(3600)).await;
         let access_target = target();
         let past = OffsetDateTime::now_utc() - time::Duration::seconds(60);
         let (user_info, ticket_id) = insert_ticket(&db, &access_target, Some(past), None).await;

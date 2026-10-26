@@ -254,7 +254,11 @@ pub(crate) async fn watch(
                 last_ok = Instant::now();
             }
             Ok(Ok(dead)) => {
-                warn!(?grant, ?dead, "Closing session: access grant is no longer live");
+                warn!(
+                    ?grant,
+                    ?dead,
+                    "Closing session: access grant is no longer live"
+                );
                 handle.close();
                 return;
             }
@@ -267,7 +271,10 @@ pub(crate) async fn watch(
                     OffsetDateTime::now_utc(),
                     unconfirmed_limit,
                 ) {
-                    warn!(?grant, "Closing session: access grant could not be confirmed in time");
+                    warn!(
+                        ?grant,
+                        "Closing session: access grant could not be confirmed in time"
+                    );
                     handle.close();
                     return;
                 }
@@ -281,7 +288,10 @@ pub(crate) async fn watch(
                     OffsetDateTime::now_utc(),
                     unconfirmed_limit,
                 ) {
-                    warn!(?grant, "Closing session: access grant could not be confirmed in time");
+                    warn!(
+                        ?grant,
+                        "Closing session: access grant could not be confirmed in time"
+                    );
                     handle.close();
                     return;
                 }
@@ -294,8 +304,8 @@ pub(crate) async fn watch(
 mod tests {
     use sea_orm::ActiveValue::Set;
     use sea_orm::{ActiveModelTrait, Database};
-    use warpgate_db_entities::Parameters::{ConfigMigrationValues, set_config_migration_values};
     use warpgate_db_entities as e;
+    use warpgate_db_entities::Parameters::{ConfigMigrationValues, set_config_migration_values};
 
     use super::*;
 
