@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   check:
-    if: github.event.comment.user.type != 'Bot'
+    if: github.repository == 'warp-tech/warpgate' && (github.event.comment.user.type != 'Bot')
     runs-on: ubuntu-latest
     steps:
       - name: Stage comment body

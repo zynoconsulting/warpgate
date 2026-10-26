@@ -10,6 +10,7 @@ concurrency:
 
 jobs:
     fmt-toml:
+        if: github.repository == 'warp-tech/warpgate'
         name: cargo-fmt-toml
         runs-on: ubuntu-latest
         steps:

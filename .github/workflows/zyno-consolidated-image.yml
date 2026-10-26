@@ -19,6 +19,7 @@ env:
 
 jobs:
   build:
+    if: github.repository == 'zynoconsulting/warpgate' && github.ref == 'refs/heads/zyno/consolidated'
     name: Build and publish AMD64 image
     runs-on: ubuntu-24.04
     permissions:
@@ -27,7 +28,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1c
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
           submodules: recursive

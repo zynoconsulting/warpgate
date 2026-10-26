@@ -6,6 +6,7 @@ on: workflow_dispatch
 
 jobs:
   reprotest:
+    if: github.repository == 'warp-tech/warpgate'
     name: Reproducibility test
     runs-on: ubuntu-24.04
 

@@ -22,6 +22,7 @@ concurrency:
 
 jobs:
   lint:
+    if: github.repository == 'warp-tech/warpgate'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -37,7 +38,7 @@ jobs:
         run: helm template ${{ env.CHART_NAME }} ${{ env.CHART_PATH }} --debug > /dev/null
 
   publish:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/chart-v')
+    if: github.repository == 'warp-tech/warpgate' && (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/chart-v'))
     needs: lint
     runs-on: ubuntu-latest
     permissions:

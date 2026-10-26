@@ -10,6 +10,7 @@ concurrency:
 
 jobs:
   check-schema-compatibility:
+    if: github.repository == 'warp-tech/warpgate'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout PR branch

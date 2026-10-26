@@ -10,6 +10,7 @@ concurrency:
 
 jobs:
   cargo-deny:
+    if: github.repository == 'warp-tech/warpgate'
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
