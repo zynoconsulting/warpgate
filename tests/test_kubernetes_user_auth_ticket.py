@@ -1234,4 +1234,3 @@ async def test_websocket_without_subprotocol_is_proxied(shared_wg, ticket_setup)
         assert offered == [None]
     finally:
         await runner.cleanup()
-

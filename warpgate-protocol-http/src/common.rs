@@ -461,7 +461,10 @@ pub async fn authorize_session(
     // a same-user step-up re-auth (web_auth_max_age_seconds) or an SSO
     // re-login has no stale grant to protect against, and detaching there
     // would needlessly kill this browser's already-open websockets/streams.
-    if matches!(session.get_auth(), Some(SessionAuthorization::Ticket { .. })) {
+    if matches!(
+        session.get_auth(),
+        Some(SessionAuthorization::Ticket { .. })
+    ) {
         session_middleware.lock().await.remove_session(session);
     }
 
