@@ -532,7 +532,6 @@ mod tests {
 
     use std::collections::HashSet;
 
-
     fn key(oidc: bool) -> CorrelationKey {
         CorrelationKey {
             user_id: Uuid::nil(),
