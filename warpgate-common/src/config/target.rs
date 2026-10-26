@@ -593,7 +593,9 @@ impl TargetSecrets for TargetKubernetesOptions {
         match &mut self.auth {
             KubernetesTargetAuth::Token(auth) => vec![&mut auth.token],
             KubernetesTargetAuth::Certificate(auth) => vec![&mut auth.private_key],
-            KubernetesTargetAuth::IamRole(_) => vec![],
+            KubernetesTargetAuth::IamRole(_) | KubernetesTargetAuth::EphemeralCertificate(_) => {
+                vec![]
+            }
         }
     }
 }
@@ -687,16 +689,15 @@ impl StoredSecrets for Target {
 mod tests {
 
     use super::{
-        DatabaseTargetAuth, DatabaseTargetIamRoleAuth, DatabaseTargetPasswordAuth, MaybeSecretRef,
-        PostgresProtocolVersion, RdpTargetCompression, RdpTlsSecurity, SSHTargetAuth, SecretRef,
-        SshTargetCertificateAuth, SshTargetIamRoleAuth, SshTargetPasswordAuth,
-        SshTargetPublicKeyAuth, Target, TargetHTTPOptions, TargetKubernetesOptions,
-        TargetMySqlOptions, TargetOptions, TargetPostgresOptions, TargetRdpOptions,
-        TargetSSHOptions, Tls,
+        DatabaseTargetAuth, DatabaseTargetIamRoleAuth, DatabaseTargetPasswordAuth,
         KUBERNETES_EPHEMERAL_CERTIFICATE_DEFAULT_VALIDITY_SECONDS, KubernetesTargetAuth,
-        KubernetesTargetEphemeralCertificateAuth,
+        KubernetesTargetEphemeralCertificateAuth, MaybeSecretRef, PostgresProtocolVersion,
+        RdpTargetCompression, RdpTlsSecurity, SSHTargetAuth, SecretRef, SshTargetCertificateAuth,
+        SshTargetIamRoleAuth, SshTargetPasswordAuth, SshTargetPublicKeyAuth, Target,
+        TargetHTTPOptions, TargetKubernetesOptions, TargetMySqlOptions, TargetOptions,
+        TargetPostgresOptions, TargetRdpOptions, TargetSSHOptions, Tls,
     };
-    use crate::{StoredSecrets, TargetSecrets};
+    use crate::StoredSecrets;
 
     const REFERENCE: &str = "secret://vault-prod/secret/db#password";
 

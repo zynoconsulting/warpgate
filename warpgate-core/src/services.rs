@@ -75,7 +75,8 @@ impl Services {
         &self,
         sessions: AdmittedSessions,
     ) -> Result<(), WarpgateError> {
-        self.cluster.notify_global(ClusterNotification::AccessRevoked);
+        self.cluster
+            .notify_global(ClusterNotification::AccessRevoked);
         if sessions.0.is_empty() {
             return Ok(());
         }

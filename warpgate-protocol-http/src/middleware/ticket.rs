@@ -5,8 +5,8 @@ use poem::session::{Session, SessionStatus};
 use poem::web::{Data, FromRequest};
 use poem::{Endpoint, Middleware, Request};
 use serde::Deserialize;
-use tracing::warn;
 use tokio::sync::Mutex;
+use tracing::warn;
 use uuid::Uuid;
 use warpgate_common::Secret;
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
@@ -150,8 +150,7 @@ impl<E: Endpoint> Endpoint for TicketMiddlewareEndpoint<E> {
                     if !session_is_temporary
                         && session.get_auth().is_some()
                         && let Ok(session_store) =
-                            Data::<&Arc<Mutex<SessionStore>>>::from_request_without_body(&req)
-                                .await
+                            Data::<&Arc<Mutex<SessionStore>>>::from_request_without_body(&req).await
                     {
                         session_store.lock().await.remove_session(&session);
                     }
