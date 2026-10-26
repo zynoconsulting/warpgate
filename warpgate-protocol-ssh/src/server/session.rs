@@ -28,8 +28,8 @@ use warpgate_common::auth::{
 use warpgate_common::eventhub::{EventHub, EventSender};
 use warpgate_common::helpers::username::username_eq_ci;
 use warpgate_common::{
-    Secret, Target, TargetOptions, TargetSSHOptions, TargetSessionId, User,
-    UserRequireCredentialsPolicy, UserFacingReason, UserSessionId, WarpgateError,
+    Secret, Target, TargetOptions, TargetSSHOptions, TargetSessionId, User, UserFacingReason,
+    UserRequireCredentialsPolicy, UserSessionId, WarpgateError,
 };
 use warpgate_common_http::ext::construct_external_url;
 use warpgate_core::approvals::{GateOutcome, GatedConnection};
@@ -2670,20 +2670,18 @@ impl ServerSession {
                         // spending the ticket's use on an attempt that could
                         // never have been genuinely authorized.
                         // Looked up by id, and a missing user fails closed.
-                        let ticket_user = warpgate_db_entities::User::Entity::find_by_id(
-                            user_info.id,
-                        )
-                        .one(&self.services.db)
-                        .await
-                        .map_err(WarpgateError::from)?
-                        .map(User::try_from)
-                        .transpose()?;
+                        let ticket_user =
+                            warpgate_db_entities::User::Entity::find_by_id(user_info.id)
+                                .one(&self.services.db)
+                                .await
+                                .map_err(WarpgateError::from)?
+                                .map(User::try_from)
+                                .transpose()?;
                         let Some(ticket_user) = ticket_user else {
                             warn!(username = %user_info.username, "Ticket user no longer exists");
                             return Ok(AuthResult::Rejected);
                         };
-                        if ssh_policy_requires_credentials(ticket_user.credential_policy.as_ref())
-                        {
+                        if ssh_policy_requires_credentials(ticket_user.credential_policy.as_ref()) {
                             warn!(
                                 username = %user_info.username,
                                 "Ticket-secret SSH login rejected: user's credential policy \

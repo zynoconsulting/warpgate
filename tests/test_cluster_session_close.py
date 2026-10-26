@@ -171,4 +171,3 @@ class Test:
                 return api.get_session(session_id).ended is not None
 
         assert _poll(ended), "session never marked ended after ticket revocation"
-
