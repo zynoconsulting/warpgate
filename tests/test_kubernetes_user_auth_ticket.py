@@ -736,4 +736,3 @@ async def test_ticket_revocation_still_closes_a_websocket_after_session_max_age(
                 ), closed
     finally:
         await runner.cleanup()
-

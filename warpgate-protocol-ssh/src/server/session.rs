@@ -2523,7 +2523,9 @@ impl ServerSession {
                         {
                             Ok(()) => Ok(AuthResult::Accepted { user_info }),
                             Err(WarpgateError::TargetAccessRevoked) => {
-                                warn!("Ticket was revoked or expired before the session could start");
+                                warn!(
+                                    "Ticket was revoked or expired before the session could start"
+                                );
                                 Ok(AuthResult::Rejected)
                             }
                             Err(error) => Err(error.into()),
