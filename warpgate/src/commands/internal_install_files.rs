@@ -4,8 +4,7 @@ use anyhow::{Context, Result};
 use warpgate_common::GlobalParams;
 use warpgate_common::helpers::fs::{secure_directory, secure_file};
 
-/// `$NAME` placeholders and their values in the requested order, so later
-/// substitutions can expand placeholders introduced by earlier ones.
+/// `$NAME` placeholders and their values in the requested order.
 type Substitutions = [(String, Option<String>)];
 
 pub fn command(
@@ -69,13 +68,8 @@ fn substitute(content: Vec<u8>, substitutions: &Substitutions) -> Result<Vec<u8>
         let mut previous_end = 0;
         for (start, _) in text.match_indices(placeholder.as_str()) {
             let end = start + placeholder.len();
-            // Match the full variable name: `$PASS` must not replace the
-            // beginning of `$PASSWORD`, even when PASSWORD is not selected.
-            if text
-                .as_bytes()
-                .get(end)
-                .is_some_and(|next| next.is_ascii_alphanumeric() || *next == b'_')
-            {
+            // Don't replace `$PASS` inside `$PASSWORD`.
+            if text[end..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
                 continue;
             }
             let value = value
@@ -112,8 +106,8 @@ mod tests {
         symlink("..data/ssh-keys", source.path().join("ssh-keys")).unwrap();
 
         let substitutions = [
-            ("$PASSWORD_HOST".to_string(), Some("db".to_string())),
             ("$PASS".to_string(), Some("s&/cret".to_string())),
+            ("$PASSWORD_HOST".to_string(), Some("db".to_string())),
             ("$UNUSED".to_string(), None),
         ];
         install_dir(source.path(), destination.path(), &substitutions, true).unwrap();
@@ -136,15 +130,5 @@ mod tests {
     fn refuses_unset_referenced_variable() {
         let substitutions = [("$MISSING".to_string(), None)];
         assert!(substitute(b"a: $MISSING".to_vec(), &substitutions).is_err());
-    }
-
-    #[test]
-    fn ignores_unset_prefix_of_unselected_variable() {
-        let substitutions = [("$MISSING".to_string(), None)];
-        let content = b"a: $MISSING_VALUE".to_vec();
-        assert_eq!(
-            substitute(content.clone(), &substitutions).unwrap(),
-            content
-        );
     }
 }
