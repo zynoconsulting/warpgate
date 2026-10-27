@@ -136,7 +136,7 @@ pub(crate) enum Commands {
     UnattendedSetup(UnattendedSetupArgs),
     #[command(hide = true)]
     InternalInstallFiles {
-        /// Replace `$NAME` with the value of these environment variables (space-separated)
+        /// Replace `$NAME` with these environment variables (space-separated, in the given order)
         #[clap(long, value_delimiter = ' ')]
         substitute_env: Vec<String>,
         source: PathBuf,
