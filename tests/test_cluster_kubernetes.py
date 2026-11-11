@@ -180,6 +180,12 @@ def test_join_does_not_replace_a_revoked_grant_with_a_sibling(nodes, echo_server
         # sibling, but the original session must never adopt its grant.
         response = token_request(peer, token, target)
         assert response.status_code in (200, 401, 403), response.text
+        if response.status_code == 200:
+            assert any(
+                s.id != original.id and s.ended is None
+                and any(str(t.ticket_id) == sibling_id for t in s.target_sessions)
+                for s in kubernetes_sessions(api, user)
+            ), "a sibling ticket must open a fresh session, not revive the original"
         original_after = next(s for s in kubernetes_sessions(api, user) if s.id == original.id)
         assert all(str(t.ticket_id) != sibling_id for t in original_after.target_sessions)
         assert poll(lambda: next(

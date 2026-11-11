@@ -1,0 +1,260 @@
+Warpgate upstream integration - 2026-11-11
+
+Destination: local zyno/upstream-update-2026-11-11
+Base: origin/zyno/consolidated a962ed4fa848db9cd9dc98deb8149d8d0e0fca80
+Original checkout: zyno/operational 027a80f51a370605b85147f704a11d50471f02d5
+Upstream main: 719158eaf295d95a21b2c1329533cc9b3a22a851
+Latest stable tag: v0.30.4, 00da5ca3f047c86f0c10e0e0414436983b975f28
+
+History and scope
+
+Fetched both remotes with pruning; fetched upstream tags. The origin URL
+(zyno-io/warpgate) redirects to zynoconsulting/warpgate. The local operational
+line is older than the remote consolidated line and has different, pre-rebase
+commit IDs. Neither is an ancestor of the other. Their shared ancestor is
+eb38ff18; operational has 18 unique commits and consolidated has 317.
+Consolidated already contains origin/main at v0.30.2 (8d40335c), 83 commits
+unique from upstream/main, and lacks 36 upstream/main commits before this update.
+
+Merged current upstream/main into the current consolidated tree, preserving
+history, then merged v0.30.4. Main contains all parents of the stable tag, but
+not the tag's version-only commit; otherwise main still reports v0.30.3.
+The release merge changes only versions and preserves main's newer dependency
+versions and Helm chart 0.2.1. Both upstream refs are ancestors of the result.
+
+Final history counts including this handoff commit:
+  upstream/main: behind 0, ahead 87
+  v0.30.4: behind 0, ahead 114
+  origin/zyno/consolidated: behind 0, ahead 40
+
+No feature branch was blindly merged or replayed. Branch-only commits were
+examined, including adaptation/formatting commits on branches whose substantive
+features already exist in consolidated. Exact patch IDs alone are insufficient
+because most feature branches were rebased onto v0.30.2 and upstream used
+squashes or alternative implementations.
+
+Sean selected existing consolidated features only. Slack and MCP are excluded.
+All original branches remain untouched. There were no pushes, PR creations,
+image publications, deployments, or production changes.
+
+Ranked branch disposition (names below omit the origin/ remote prefix)
+
+Priority 1 - already in consolidated; retain and adapt as required
+
+  zyno/kubernetes-ephemeral-client-certificates (3ce5be1e)
+    Original 3fdc96f7/fd95b4e2 and test fixes are already merged. Consolidated's
+    a487ef88 already handles secret traversal; the later branch adapter adds
+    no missing feature. Retained per-session certificate cache on both opener
+    and cross-node join paths, plus fixed identities and refresh behavior.
+
+  zyno/kubernetes-ticket-jit (ca4152aa)
+    Tip is an ancestor of consolidated. Retained role-first authorization,
+    identity-before-ticket checks, bounded one-use admission, exact granting
+    ticket checks and handle-guarded eviction. Cross-node joins revalidate the
+    original admitted ticket without spending a second use or selecting a
+    sibling. Upstream credential-keyed correlation supersedes the fork's
+    coarser ticket-id/OIDC-boolean correlation key.
+
+  zyno/kubernetes-oidc-sso-policy (cca46293)
+    830e3199 and subsequent fail-closed checks already merged. The remaining
+    branch adapter is formatting. Verified OIDC SSO credentials now accompany
+    upstream's provider/subject correlation identity; API tokens/certificates
+    cannot inherit the OIDC policy result.
+
+  zyno/database-ticket-jit (dde5066b)
+    dff18798 and later helpers/hardening/tests already merged. The branch-only
+    adapter duplicates consolidated's f0c0f9fb deletion refactor and formatting.
+    Retained MySQL/PostgreSQL JIT and denial behavior.
+
+  zyno/ssh-active-ticket-grant (ab1c7b35)
+    a08bea46 and policy/user-ID hardening already merged. Adapter is duplicate
+    deletion adaptation/formatting. Retained ticket grants for authenticated
+    user:target logins and explicit-policy rejection for ticket-secret logins.
+
+  zyno/ticket-session-termination (01877fbb)
+    aae3fd4a, cross-node nudges, stream/session retention and re-auth fixes
+    already merged. Kept upstream service deletion plus Zyno access watches;
+    the old duplicate deletion helper remains removed (f0c0f9fb).
+
+  zyno/api-token-scopes (9e97c80c)
+    e340655c already merged; a487ef88/f0c0f9fb/fd76abac cover the adapter's
+    non-whitespace changes. Retained both user_api/admin_api permissions while
+    adding upstream token ID to ValidatedApiToken for credential isolation.
+    Final tip-only adapter merely removes blank lines in tests.
+
+  zyno/legacy-public-key-policy-migration (7dc2449c)
+    Tip is an ancestor of consolidated. Retained all historical migration names
+    (m00078, m00083, m00089), corrected SQL and order; added upstream m00095.
+    These history names cannot be dropped merely because new installs use a
+    later migration number.
+
+  zyno/public-key-normalization (90647eee)
+    Tip is an ancestor of consolidated. Retained OpenSSH comment normalization
+    and config-provider coverage; upstream still does not replace this patch.
+
+  zyno/ticket-request-approval (f4b5980d)
+    Feature 47e0ec7f already merged. Consolidated bc3bbb89 has the same lastTarget
+    state correction; remaining branch diff includes import ordering. Kept
+    gateway approval with upstream navigation and ticket-state changes.
+
+  zyno/ticket-request-duration (1097ce88)
+    Tip is an ancestor of consolidated. Retained effective duration limits.
+
+Priority 2 - feature already carried or absent locally; upstream now replaces it
+
+  zyno/kubernetes-ws-optional-subprotocol (d430389e)
+    e828f20d/9f4a92d3/767bafe8 already carried this feature. Replaced overlapping
+    implementation with upstream ab83bb32 (#2832), including optional/empty
+    subprotocol handling, base64 channel framing, upstream refusal forwarding,
+    session-handle retention and its tests. Kept the separate Zyno ephemeral
+    authentication and ticket-grant checks around it. No branch replay.
+
+  zyno/config-env-substitution (f22aabcb)
+    Tip is an ancestor of consolidated. Upstream 357dc987 (#2835) supersedes the
+    local implementation. Took upstream's equivalent boundary-aware ordered
+    substitution and its regression coverage. No replay of duplicate c063ec35.
+
+  zyno/ssh-ticket-public-key-auth (1ed73dcc)
+    Tip is an ancestor of consolidated. Upstream 747032d2 (#2868) handles the
+    unsigned public-key offer without spending a use through the common offer
+    validator. Removed the redundant fork offer shortcut while preserving
+    Zyno's separate credential-policy checks and ticket/JIT behavior. Retained
+    both upstream offer-only/one-use test and Zyno policy-rejection test.
+
+  zyno/expired-session-ui (f3985678)
+    1695817d was not in consolidated; fork PR #1 was closed without merging.
+    Upstream fc82f039 (#2674) now supplies expired status/dismissal and hides
+    revoke. No replay needed; other branch-only changes are shared adapters.
+
+Priority 3 - not in consolidated; explicitly excluded from this update
+
+  zyno/slack-notifications (71cb59c6)
+    Missing feature 95d06123 is not in consolidated or upstream. Deferred per
+    Sean's scope selection. Do not describe this as upstreamed or already in.
+
+  zyno/ticket-mcp (ef688092)
+    Missing feature 835fc68f is not in consolidated or upstream. Deferred per
+    Sean's scope selection; no MCP package was introduced.
+
+  zyno/slack-approvals-mcp (637d401d)
+    ebaf5f94/27f5fb84 are the older combined Slack/MCP implementation, absent
+    from consolidated/upstream. Deferred; if this work is resumed, compare it
+    against the separate notification and ticket-MCP branches to avoid two
+    competing Slack implementations.
+
+Consolidated and local-only refs
+
+  origin/zyno/consolidated (a962ed4f): chosen authoritative integration base.
+  zyno/operational (027a80f5): retained unchanged as the old working line.
+    Rebased equivalents cover ticket approval/duration, SSH/Kubernetes grants,
+    public-key normalization, ephemeral certs/fixed identities and migrations.
+    098d5cc0's configured SSH rejection methods are retained in consolidated.
+    dafa2260's host-key prompt fix is superseded by upstream e84407ca (#2478).
+    The genuinely missing 9c5e13f6 WARPGATE_SSO_FORCE_IPV4 opt-in was ported to
+    the current SSO client. It accepts 1/true/TRUE and defaults to normal egress.
+  zyno/fix-legacy-migration-history (b41e966a): superseded by consolidated's
+    broader 7dc2449c migration-history retention; operational's later 027a80f5
+    SQL correction is also already present. No replay.
+  zyno/kubernetes-ephemeral-client-cert (2f44f260): old local spelling/commit;
+    superseded by 3fdc96f7/fd95b4e2 plus later consolidated fixes. No replay.
+
+Conflict hotspots
+
+Ten files required conflict resolution in the main merge:
+  tests/test_kubernetes_user_auth_ticket.py
+  tests/test_ssh_user_auth_ticket.py
+  warpgate-core/src/config_providers/db.rs
+  warpgate-core/src/config_providers/mod.rs
+  warpgate-protocol-http/src/common.rs
+  warpgate-protocol-kubernetes/src/correlator.rs
+  warpgate-protocol-kubernetes/src/server/auth.rs
+  warpgate-protocol-kubernetes/src/server/handlers.rs
+  warpgate-protocol-ssh/src/server/session.rs
+  warpgate/src/commands/internal_install_files.rs
+
+The difficult intersection is the upstream database-backed Kubernetes correlator
+(8084f01b plus presented-credential keying 8b1956c6) with Zyno's ephemeral identity
+cache and role/ticket authorization. A joining node reads the original target
+session's exact ticket and validates it without consumption; it does not replace
+it with any other active ticket. Watchers remain attached on each serving node.
+Added two cluster regression tests for bounded grant reuse and revoked-grant
+handling with an active sibling. Upstream moved the old single-use cross-node
+test into test_cluster_kubernetes.py; its replacement is retained there.
+
+Retained fork workflow gates. Newly added upstream issue labeling and triage
+jobs also remain upstream-only, matching dbe4f597's existing policy. The existing
+consolidated-only AMD64 image publishing workflow is unchanged. Standard fork
+build/test workflows remain intentionally gated off; opening a PR is not a
+substitute for running validation.
+
+Validation
+
+Passed:
+  - Frontend npm ci and npm run build; Svelte reported 0 errors/0 warnings.
+  - 345 Rust unit tests across core (160), migrations (20), HTTP (52),
+    Kubernetes (41), SSH (45), and SSO (27).
+  - cargo fmt --all -- --check.
+  - All workflow jobs checked for repository ownership gates.
+  - git diff --check against upstream/main, plus conflict-marker checks.
+  - Python syntax/test-name retention checks and collection of 35 targeted
+    Kubernetes integration cases; generated SDK and test dependencies prepared.
+
+Additional completed validation:
+  - cargo build --locked --all-features -p warpgate; binary reports v0.30.4.
+  - cargo check --locked --workspace --all-features on final release metadata.
+  - All 35 local Kubernetes integration cases passed in 62.94 seconds,
+    including both new cross-node JIT regression tests.
+
+  - All 4 CLI substitution unit tests passed.
+  - CLI ordered environment-substitution integration test passed.
+
+Total: 349 Rust unit tests and 36 integration tests passed. All changes are
+committed and the working tree is clean. Logs are retained under .git/upstream-*.
+The Rust build emits existing unused-dependency/future-compatibility warnings;
+there are no compiler or test failures remaining.
+
+The local Kubernetes suite uses isolated test databases and echo upstreams.
+The full Docker/K3s/OIDC and live MySQL/PostgreSQL integration matrix, and an
+upgrade rehearsal with a copied operational database, remain suggested smoke
+checks for Sean; they were not run as part of this update.
+
+Suggested next smoke checks
+
+Use isolated local/test data. First exercise migrations from a copied operational
+SQLite/PostgreSQL/MySQL database, specifically retaining recorded historical
+migration names. Then cover API-token user/admin permission combinations,
+SSH public-key-only ticket login with one use, normal SSH/MySQL/PostgreSQL JIT,
+and rejection when a credential policy needs an additional factor.
+
+For Kubernetes, cover OIDC SSO policy, API-token/client-cert separation, token and
+fixed ephemeral certificate identities, certificate refresh, exec/attach/watch,
+optional websocket subprotocol, two-node bounded-ticket sharing, ticket expiry,
+revocation while streams are open, and replacement access after stale eviction.
+Check gateway request approval/duration, expired ticket dismissal, host-key prompt
+visibility, config substitution ordering, and IPv4-only SSO in an isolated network.
+
+Suggested integration commands (after building and generating the SDK):
+  cargo build --locked --all-features -p warpgate
+  cd warpgate-web
+  npm ci
+  npm run openapi:tests-sdk
+  npm run build
+  cd ../tests
+  poetry install --no-root
+  TIMEOUT=60 poetry run pytest --timeout 180 test_cluster_kubernetes.py test_kubernetes_user_auth_ticket.py
+
+The broader SSH/database suite requires its local Docker images and services;
+use tests/Makefile and the repository test runner for those checks.
+
+Push/PR handoff
+
+Left local: the fork history uses direct consolidated merges; its only listed PR
+was closed unmerged. No automatic push or PR creation was inferred.
+To publish this review branch without touching the consolidated publisher:
+  git push -u origin zyno/upstream-update-2026-11-11
+Then, if Sean wants a PR:
+  gh pr create --repo zynoconsulting/warpgate --base zyno/consolidated --head zyno/upstream-update-2026-11-11 --title 'Update consolidated Warpgate to current upstream and v0.30.4' --body-file .git/upstream-pr-body.txt
+
+The proposed PR body is prepared locally at .git/upstream-pr-body.txt. Merging
+into zyno/consolidated would invoke its existing image publication workflow;
+that merge and any rollout remain Sean's next step.

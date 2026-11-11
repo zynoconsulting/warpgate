@@ -313,14 +313,14 @@ pub async fn authorize_kubernetes_join(
         return Err(unauthorized());
     };
     if let Some(ticket_id) = session.ticket_id {
-        if !warpgate_core::has_active_self_service_ticket(
+        let ticket_is_active = warpgate_core::has_active_self_service_ticket(
             &services.db,
             ticket_id,
             user.id,
             target.id,
         )
-        .await?
-        {
+        .await?;
+        if !ticket_is_active {
             return Err(unauthorized());
         }
         return TargetAuthorization::for_ticket_session(
@@ -585,8 +585,9 @@ async fn authenticate(
             // the stored-SSO-linkage `validate_credential` arm, which would deny
             // legitimately-authenticated users resolved via preferred-username or
             // role mapping.
+            let user = user_for_username(services, &username).await?;
             return Ok(Some(KubernetesIdentity::User {
-                user: user_for_username(services, &username).await?,
+                user,
                 credential: TransportCredential::OidcToken {
                     provider: provider_config.name.clone(),
                     subject: response.subject,
