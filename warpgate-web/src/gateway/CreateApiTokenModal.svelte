@@ -148,7 +148,7 @@
                 Create
             </Button>
 
-            <Button color="danger" class="modal-button" on:click={_cancel}>
+            <Button color="secondary" class="modal-button" on:click={_cancel}>
                 Cancel
             </Button>
         </ModalFooter>

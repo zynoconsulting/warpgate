@@ -84,9 +84,7 @@
 {/if}
 
 <Loadable promise={api.getMyApiTokens()}>
-    {#snippet children(
-        tokens,
-    )}
+    {#snippet children(tokens)}
         {#if tokens.length === 0}
             <EmptyState
                 title="No tokens yet"

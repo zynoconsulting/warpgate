@@ -28,6 +28,7 @@ use warpgate_sso::SsoProviderConfig;
 use crate::login_protection::LoginProtectionService;
 
 pub struct ValidatedApiToken {
+    pub id: Uuid,
     pub user: User,
     pub permissions: ApiTokenPermissions,
 }
@@ -477,6 +478,12 @@ impl ValidatedTicket {
 
     pub fn target(&self) -> &Target {
         self.authorization.target()
+    }
+
+    /// For joining a session this ticket already opened, so no use is spent.
+    /// `validate_ticket` has already re-checked expiry and revocation.
+    pub fn join(self) -> TargetAuthorization {
+        self.authorization
     }
 
     pub async fn spend(

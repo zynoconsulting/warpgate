@@ -45,7 +45,7 @@
         </a>
 
         <a
-            href="/@warpgate/admin#/config/targets/create"
+            href="/@warpgate/admin#/manage/targets/create"
             class="list-group-item list-group-item-action d-flex align-items-center"
         >
             <Fa icon={setupState.hasTargets ? faCircleCheck : faCircle} />
@@ -59,7 +59,7 @@
         </a>
 
         <a
-            href="/@warpgate/admin#/config/users/create"
+            href="/@warpgate/admin#/manage/users/create"
             class="list-group-item list-group-item-action d-flex align-items-center"
         >
             <Fa icon={setupState.hasUsers ? faCircleCheck : faCircle} />

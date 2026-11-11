@@ -1067,6 +1067,7 @@ impl ConfigProvider for DatabaseConfigProvider {
         };
 
         Ok(Some(ValidatedApiToken {
+            id: api_token.id,
             user: user.try_into()?,
             permissions: ApiTokenPermissions {
                 user_api: api_token.user_api,

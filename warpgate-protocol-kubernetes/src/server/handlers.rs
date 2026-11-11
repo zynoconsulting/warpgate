@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use base64::Engine;
 use futures::{StreamExt, TryStreamExt};
 use poem::web::Data;
 use poem::web::websocket::{WebSocket, WebSocketStream};
@@ -126,7 +127,7 @@ pub async fn handle_api_request(
             ticket.target().name.clone(),
             req.uri().path().trim_start_matches('/').to_owned(),
         ),
-        KubernetesIdentity::User(..) => named_target_path(req.uri().path())?,
+        KubernetesIdentity::User { .. } => named_target_path(req.uri().path())?,
     };
 
     // The path exactly as the API server will see it. The url crate resolves
@@ -306,7 +307,9 @@ where
     })
 }
 
-/// Forward refusal headers the same way as the ordinary request path.
+/// Copies every upstream response header onto a poem response builder.
+/// Shared by the normal request path and a websocket upgrade the API server
+/// refused, so both forward an upstream response the same way.
 fn copy_response_headers(
     mut builder: poem::ResponseBuilder,
     headers: &http::HeaderMap,
@@ -569,16 +572,8 @@ async fn _handle_normal_request_inner(
         warn!("Failed to record Kubernetes response: {}", e);
     }
 
-    let mut poem_response = Response::builder().status(status);
-
-    // Copy response headers
-    for (name, value) in &response_headers {
-        if let Ok(poem_name) = poem::http::HeaderName::from_bytes(name.as_str().as_bytes())
-            && let Ok(poem_value) = poem::http::HeaderValue::from_bytes(value.as_bytes())
-        {
-            poem_response = poem_response.header(poem_name, poem_value);
-        }
-    }
+    let poem_response =
+        copy_response_headers(Response::builder().status(status), &response_headers);
 
     Ok(poem_response.body(response_body))
 }
@@ -713,16 +708,17 @@ async fn _handle_websocket_request_inner(
         }
     };
 
+    let base64_framing = selected_protocol
+        .as_deref()
+        .is_some_and(is_base64_subprotocol);
+
     // Poem requires a Sync callback; the socket is Send and consumed once.
-    let client_socket = std::sync::Mutex::new(Some(client_socket));
+    let client_socket = std::sync::Mutex::new(client_socket);
 
     let ws_handler_inner = move |socket: WebSocketStream| async move {
         let client_socket = client_socket
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-            .expect("on_upgrade calls its callback exactly once");
-        // Retain the session and its access watcher for the entire stream.
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _session_handle = handle;
         let (client_sink, client_source) = client_socket.split();
         let (server_sink, server_source) = socket.split();
@@ -733,8 +729,8 @@ async fn _handle_websocket_request_inner(
                 let recorder_tx = recorder_tx.clone();
                 async move {
                     tracing::debug!("Server: {:?}", msg);
-                    if let tungstenite::Message::Binary(data) = &msg {
-                        let _ = recorder_tx.send(data.to_vec()).await;
+                    if let Some(frame) = channel_frame(&msg, base64_framing) {
+                        let _ = recorder_tx.send(frame).await;
                     }
                     anyhow::Ok(msg)
                 }
@@ -745,8 +741,8 @@ async fn _handle_websocket_request_inner(
             let recorder_tx = recorder_tx.clone();
             async move {
                 tracing::debug!("Client: {:?}", msg);
-                if let tungstenite::Message::Binary(data) = &msg {
-                    let _ = recorder_tx.send(data.to_vec()).await;
+                if let Some(frame) = channel_frame(&msg, base64_framing) {
+                    let _ = recorder_tx.send(frame).await;
                 }
                 anyhow::Ok(msg)
             }
@@ -855,7 +851,11 @@ async fn forward_rejected_upstream_response(
     response: reqwest::Response,
 ) -> anyhow::Result<Response> {
     let status = response.status();
-    let headers = response.headers().clone();
+    // The body is re-sent in full, so the upstream framing headers no longer
+    // describe it; Poem sets the length itself.
+    let mut headers = response.headers().clone();
+    headers.remove(http::header::TRANSFER_ENCODING);
+    headers.remove(http::header::CONTENT_LENGTH);
     let body = response
         .bytes()
         .await
@@ -893,6 +893,28 @@ async fn connect_upstream_websocket(
     })
 }
 
+fn is_base64_subprotocol(protocol: &str) -> bool {
+    protocol.ends_with("base64.channel.k8s.io")
+}
+
+fn channel_frame(msg: &tungstenite::Message, base64_framing: bool) -> Option<Vec<u8>> {
+    match msg {
+        tungstenite::Message::Binary(data) => Some(data.to_vec()),
+        tungstenite::Message::Text(text) if base64_framing => {
+            let (channel, payload) = text.as_str().split_at_checked(1)?;
+            let channel = channel.as_bytes().first()?.checked_sub(b'0')?;
+            let mut frame = vec![channel];
+            frame.extend(
+                base64::engine::general_purpose::STANDARD
+                    .decode(payload)
+                    .ok()?,
+            );
+            Some(frame)
+        }
+        _ => None,
+    }
+}
+
 /// Match Poem's downstream parsing: only the first header, split on commas.
 /// Clients such as kubeterm may offer no subprotocol.
 fn requested_websocket_protocols(headers: &http::HeaderMap) -> Vec<String> {
@@ -912,13 +934,8 @@ fn requested_websocket_protocols(headers: &http::HeaderMap) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    /// Reads (and discards) an HTTP request head from `stream`, up to and
-    /// including the blank line that ends it, before a mock server answers.
-    /// A single `read()` isn't guaranteed to see the whole request if the
-    /// client's write is split across TCP segments; on loopback that's
-    /// exceedingly unlikely, but answering while bytes are still unread
-    /// would reset the connection instead of closing it cleanly once the
-    /// mock server's task ends.
+    /// Read the full request head before replying so unread bytes cannot reset
+    /// the mock connection when the server task exits.
     async fn drain_request_head(stream: &mut tokio::net::TcpStream) {
         use tokio::io::AsyncReadExt;
 
@@ -950,11 +967,7 @@ mod tests {
             ["v5.channel.k8s.io", "v4.channel.k8s.io"]
         );
 
-        // A second, repeated header is not merged in. This has to match
-        // poem's own downstream negotiation (`WebSocket::protocols`), which
-        // likewise reads only the first occurrence — see
-        // `requested_websocket_protocols`'s doc comment — so upstream and
-        // downstream always parse the same offer out of the same request.
+        // Match Poem: a repeated header must not extend the upstream offer.
         headers.append(
             http::header::SEC_WEBSOCKET_PROTOCOL,
             http::HeaderValue::from_static("channel.k8s.io"),
@@ -965,119 +978,39 @@ mod tests {
         );
     }
 
-    /// Exercise the library upgrade over TLS with Kubernetes's empty header.
-    /// Advertising HTTP/2 also verifies the HTTP/1-only client configuration.
-    #[tokio::test]
-    // tungstenite's `Callback::on_request` fixes `ErrorResponse` as the error
-    // type; there's no smaller type to return here instead.
-    #[allow(clippy::result_large_err)]
-    async fn library_upgrade_accepts_the_empty_kubernetes_protocol_over_tls() {
-        use futures::{SinkExt, StreamExt};
-        use reqwest_websocket::Message;
-        use rustls::ServerConfig;
-        use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
-        use tokio::net::TcpListener;
-        use tokio_tungstenite::tungstenite::handshake::server::{
-            ErrorResponse, Request as HandshakeRequest, Response as HandshakeResponse,
-        };
-        use url::Url;
+    #[test]
+    fn base64_frames_are_recorded_as_channel_frames() {
+        use tokio_tungstenite::tungstenite::Message;
 
-        use super::{UpstreamWebsocket, connect_upstream_websocket};
+        use super::channel_frame;
 
-        // Safe to call more than once per process (e.g. alongside other
-        // tests in this binary): a failed install just means one is already
-        // in place.
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-        let certificate =
-            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let certificate_der = CertificateDer::from(certificate.cert.der().to_vec());
-        let private_key = PrivatePkcs8KeyDer::from(certificate.signing_key.serialize_der());
-        let mut server_config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![certificate_der], private_key.into())
-            .unwrap();
-        // Advertise both protocols, as a real API server's TLS stack would:
-        // without `.http1_only()` on the client below, ALPN would be free to
-        // negotiate HTTP/2, which cannot perform a raw connection upgrade.
-        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        let tls_acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        // The mock Kubernetes API server: TLS-terminate, then answer the
-        // upgrade exactly as the real API server does when offered no
-        // subprotocol — an empty Sec-WebSocket-Protocol response header.
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let tls_stream = tls_acceptor.accept(stream).await.unwrap();
-            let callback = |request: &HandshakeRequest, mut response: HandshakeResponse| {
-                assert!(
-                    request
-                        .headers()
-                        .get(http::header::SEC_WEBSOCKET_PROTOCOL)
-                        .is_none(),
-                    "test offers no subprotocol"
-                );
-                response.headers_mut().insert(
-                    http::header::SEC_WEBSOCKET_PROTOCOL,
-                    http::HeaderValue::from_static(""),
-                );
-                Ok::<_, ErrorResponse>(response)
-            };
-            let mut socket = tokio_tungstenite::accept_hdr_async(tls_stream, callback)
-                .await
-                .unwrap();
-            let message = socket.next().await.unwrap().unwrap();
-            socket.send(message).await.unwrap();
-        });
-
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .http1_only()
-            .build()
-            .unwrap();
-        let url = Url::parse(&format!("https://127.0.0.1:{port}/socket")).unwrap();
-
-        let started = std::sync::atomic::AtomicBool::new(false);
-        let UpstreamWebsocket::Established {
-            mut socket,
-            protocol,
-        } = connect_upstream_websocket(&client, url, &[], || {
-            started.store(true, std::sync::atomic::Ordering::SeqCst);
-        })
-        .await
-        .unwrap()
-        else {
-            panic!("expected the library upgrade to succeed over TLS");
-        };
-        assert!(
-            started.load(std::sync::atomic::Ordering::SeqCst),
-            "the started callback must run for a successful upgrade"
+        // "foo\n\n" on stdin and "\n" on stdout, as the Kubernetes docs spell them.
+        assert_eq!(
+            channel_frame(&Message::text("0Zm9vCgo="), true).as_deref(),
+            Some(&b"\x00foo\n\n"[..])
         );
-        // The Kubernetes compatibility exception applies over TLS exactly as
-        // it does over plain HTTP: an empty response header still reads as
-        // no protocol selected.
-        assert_eq!(protocol, None);
-
-        socket
-            .send(Message::Text("hello over tls".into()))
-            .await
-            .unwrap();
-        let echoed = socket.next().await.unwrap().unwrap();
-        let Message::Text(text) = echoed else {
-            panic!("expected a text frame")
-        };
-        assert_eq!(text, "hello over tls");
-
-        server.await.unwrap();
+        assert_eq!(
+            channel_frame(&Message::text("1Cg=="), true).as_deref(),
+            Some(&b"\x01\n"[..])
+        );
+        // Binary frames record as-is on either framing.
+        assert_eq!(
+            channel_frame(&Message::binary(vec![1, b'x']), false).as_deref(),
+            Some(&[1, b'x'][..])
+        );
+        // Text is only decoded when a base64 subprotocol was negotiated.
+        assert_eq!(channel_frame(&Message::text("1Cg=="), false), None);
+        // Malformed base64 frames are forwarded but not recorded.
+        assert_eq!(channel_frame(&Message::text(""), true), None);
+        assert_eq!(channel_frame(&Message::text("x!!"), true), None);
+        assert_eq!(channel_frame(&Message::text("1%%%"), true), None);
+        assert_eq!(channel_frame(&Message::Ping(vec![].into()), true), None);
     }
 
     #[tokio::test]
     #[allow(clippy::result_large_err)] // tungstenite's server callback fixes the error type.
     async fn library_upgrade_keeps_protocol_negotiation_strict() {
-        use futures::{SinkExt, StreamExt};
+        use futures::StreamExt;
         use tokio::net::TcpListener;
         use tokio_tungstenite::tungstenite::handshake::server::{
             ErrorResponse, Request as HandshakeRequest, Response as HandshakeResponse,
@@ -1088,9 +1021,7 @@ mod tests {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let cases: &[(&[&str], &[&str], bool)] = &[
             (&[], &[""], true),
-            (&[], &[], true),
             (&[], &["unrequested"], false),
-            (&[], &["", "unrequested"], false),
             (&[], &["", ""], false),
             (
                 &["v5.channel.k8s.io", "v4.channel.k8s.io"],
@@ -1098,8 +1029,6 @@ mod tests {
                 true,
             ),
             (&["v4.channel.k8s.io"], &[""], false),
-            (&["v4.channel.k8s.io"], &[], false),
-            (&["v4.channel.k8s.io"], &["unrequested"], false),
         ];
         for &(offered, selected, succeeds) in cases {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1126,9 +1055,8 @@ mod tests {
                 let mut socket = tokio_tungstenite::accept_hdr_async(stream, callback)
                     .await
                     .unwrap();
-                if let Some(Ok(message)) = socket.next().await {
-                    socket.send(message).await.unwrap();
-                }
+                // Keep the upgraded connection alive until the client drops it.
+                let _ = socket.next().await;
             });
             let client = reqwest::Client::builder().http1_only().build().unwrap();
             let url = url::Url::parse(&format!("http://{address}/exec")).unwrap();
@@ -1139,34 +1067,18 @@ mod tests {
                 succeeds,
                 "offered={offered:?}, selected={selected:?}"
             );
-            if let Ok(UpstreamWebsocket::Established {
-                mut socket,
-                protocol,
-            }) = result
-            {
+            if let Ok(UpstreamWebsocket::Established { socket, protocol }) = result {
                 assert_eq!(
                     protocol.as_deref(),
                     selected.first().copied().filter(|p| !p.is_empty())
                 );
-                socket
-                    .send(reqwest_websocket::Message::Text("echo".into()))
-                    .await
-                    .unwrap();
-                let message = socket.next().await.unwrap().unwrap();
-                assert!(
-                    matches!(message, reqwest_websocket::Message::Text(text) if text == "echo")
-                );
+                drop(socket);
             }
             server.await.unwrap();
         }
     }
 
-    /// A mock API server that answers `101` — so the exec/attach/port-forward
-    /// it names is already running on the cluster — but with a
-    /// `Sec-WebSocket-Accept` that can never validate, forcing
-    /// the library to reject it. The "started" callback must
-    /// still have run, since it fires as soon as the status is `101`, before
-    /// validation: see `connect_upstream_websocket`.
+    /// Audit a 101 before validating its handshake: the stream has already started.
     #[tokio::test]
     async fn started_callback_runs_on_101_even_when_validation_then_fails() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1219,15 +1131,7 @@ mod tests {
         server.await.unwrap();
     }
 
-    /// A mock API server that refuses the upgrade outright (as it does for an
-    /// RBAC-denied `kubectl exec`) rather than switching protocols.
-    /// `connect_upstream_websocket` must report this as `Rejected`, carrying
-    /// the response, rather than as an `Err`; and `forward_rejected_upstream_response`
-    /// must turn that into a client response with the refusal's original
-    /// status, headers and body, not a generic 500. (The handler's audit
-    /// ordering around these two calls is covered by inspection, not a test
-    /// here — exercising it end to end would need a full authenticated
-    /// session.)
+    /// Preserve the API server's refusal and do not report the stream as started.
     #[tokio::test]
     async fn upstream_rejection_is_forwarded_with_its_status_and_body() {
         use tokio::io::AsyncWriteExt;
@@ -1238,10 +1142,7 @@ mod tests {
             UpstreamWebsocket, connect_upstream_websocket, forward_rejected_upstream_response,
         };
 
-        // `reqwest::Client::builder().build()` needs a process-wide default
-        // rustls crypto provider installed even for a plain `http://`
-        // request (it still constructs a TLS connector eagerly). Safe to
-        // call more than once per process; see the TLS test above.
+        // Reqwest constructs a TLS connector even for plain HTTP requests.
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

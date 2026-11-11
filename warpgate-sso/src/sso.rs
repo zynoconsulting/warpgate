@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr};
 
 use openidconnect::core::{
     CoreAuthDisplay, CoreAuthPrompt, CoreAuthenticationFlow, CoreClientAuthMethod,
@@ -228,9 +229,17 @@ async fn make_client(
 
 impl SsoClient {
     pub fn new(config: SsoInternalProviderConfig) -> Result<Self, SsoError> {
+        let mut http_client = reqwest::ClientBuilder::new();
+        // Private deployments can opt out of IPv6 egress for SSO requests.
+        if matches!(
+            std::env::var("WARPGATE_SSO_FORCE_IPV4").as_deref(),
+            Ok("1" | "true" | "TRUE")
+        ) {
+            http_client = http_client.local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        }
         Ok(Self {
             config,
-            http_client: reqwest::ClientBuilder::new().build()?,
+            http_client: http_client.build()?,
         })
     }
 
