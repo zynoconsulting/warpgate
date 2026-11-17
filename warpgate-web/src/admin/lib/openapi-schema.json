@@ -2,7 +2,7 @@
   "openapi": "3.0.0",
   "info": {
     "title": "Warpgate Web Admin",
-    "version": "v0.30.3-53-g5b247cbb"
+    "version": "v0.30.4-124-gf93af8dc"
   },
   "servers": [
     {
@@ -4595,6 +4595,31 @@
         "operationId": "revoke_certificate_credential"
       }
     },
+    "/instance-ca/certificate": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstanceCaCertificate"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          }
+        ],
+        "operationId": "get_instance_ca_certificate"
+      }
+    },
     "/secret-backends": {
       "get": {
         "responses": {
@@ -4988,31 +5013,6 @@
         ],
         "operationId": "get_secret_reference_usage"
       }
-    },
-    "/instance-ca/certificate": {
-      "get": {
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json; charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/InstanceCaCertificate"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "TokenSecurityScheme": []
-          },
-          {
-            "CookieSecurityScheme": []
-          }
-        ],
-        "operationId": "get_instance_ca_certificate"
-      }
     }
   },
   "components": {
@@ -5344,7 +5344,7 @@
           },
           "serve_through_warpgate": {
             "type": "boolean",
-            "description": "Stream recordings through Warpgate instead of redirecting the browser to\na SAS URL.\n\nRedirecting is cheaper \u2014 the bytes never touch Warpgate \u2014 but it needs\nthe container to carry a CORS policy allowing this origin to issue Range\nrequests, and it needs the browser to be able to reach the storage\naccount at all, which it cannot when the account sits behind a private\nendpoint.",
+            "description": "Stream recordings through Warpgate instead of redirecting the browser to\na SAS URL.\n\nRedirecting is cheaper — the bytes never touch Warpgate — but it needs\nthe container to carry a CORS policy allowing this origin to issue Range\nrequests, and it needs the browser to be able to reach the storage\naccount at all, which it cannot when the account sits behind a private\nendpoint.",
             "default": false
           }
         }
@@ -6005,6 +6005,19 @@
           }
         }
       },
+      "InstanceCaCertificate": {
+        "type": "object",
+        "title": "InstanceCaCertificate",
+        "required": [
+          "certificate_pem"
+        ],
+        "properties": {
+          "certificate_pem": {
+            "type": "string",
+            "description": "PEM-encoded public certificate for the Warpgate instance CA. Install\nthis certificate in a Kubernetes API server's client-CA trust bundle\nbefore enabling ephemeral-certificate upstream authentication."
+          }
+        }
+      },
       "IpEchoInfo": {
         "type": "object",
         "title": "IpEchoInfo",
@@ -6108,6 +6121,28 @@
           }
         ]
       },
+      "KubernetesTargetAuth_KubernetesTargetEphemeralCertificateAuth": {
+        "allOf": [
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "EphemeralCertificate"
+                ],
+                "example": "EphemeralCertificate"
+              }
+            }
+          },
+          {
+            "$ref": "#/components/schemas/KubernetesTargetEphemeralCertificateAuth"
+          }
+        ]
+      },
       "KubernetesTargetAuth_KubernetesTargetIamRoleAuth": {
         "allOf": [
           {
@@ -6165,6 +6200,24 @@
           },
           "private_key": {
             "type": "string"
+          }
+        }
+      },
+      "KubernetesTargetEphemeralCertificateAuth": {
+        "type": "object",
+        "title": "KubernetesTargetEphemeralCertificateAuth",
+        "required": [
+          "validity_seconds"
+        ],
+        "properties": {
+          "validity_seconds": {
+            "type": "integer",
+            "format": "uint32",
+            "description": "Validity of each in-memory upstream certificate. The certificate is\nrenewed for an active Warpgate session before it expires."
+          },
+          "username": {
+            "type": "string",
+            "description": "Optional Kubernetes username (certificate subject CN) for every\nupstream connection to this target. When omitted, Warpgate preserves\nthe authenticated user's identity as `warpgate:<username>`."
           }
         }
       },
@@ -9416,59 +9469,6 @@
         "properties": {
           "password": {
             "type": "string"
-          }
-        }
-      },
-      "InstanceCaCertificate": {
-        "type": "object",
-        "title": "InstanceCaCertificate",
-        "required": [
-          "certificate_pem"
-        ],
-        "properties": {
-          "certificate_pem": {
-            "type": "string",
-            "description": "PEM-encoded public certificate for the Warpgate instance CA. Install\nthis certificate in a Kubernetes API server's client-CA trust bundle\nbefore enabling ephemeral-certificate upstream authentication."
-          }
-        }
-      },
-      "KubernetesTargetAuth_KubernetesTargetEphemeralCertificateAuth": {
-        "allOf": [
-          {
-            "type": "object",
-            "required": [
-              "kind"
-            ],
-            "properties": {
-              "kind": {
-                "type": "string",
-                "enum": [
-                  "EphemeralCertificate"
-                ],
-                "example": "EphemeralCertificate"
-              }
-            }
-          },
-          {
-            "$ref": "#/components/schemas/KubernetesTargetEphemeralCertificateAuth"
-          }
-        ]
-      },
-      "KubernetesTargetEphemeralCertificateAuth": {
-        "type": "object",
-        "title": "KubernetesTargetEphemeralCertificateAuth",
-        "required": [
-          "validity_seconds"
-        ],
-        "properties": {
-          "validity_seconds": {
-            "type": "integer",
-            "format": "uint32",
-            "description": "Validity of each in-memory upstream certificate. The certificate is\nrenewed for an active Warpgate session before it expires."
-          },
-          "username": {
-            "type": "string",
-            "description": "Optional Kubernetes username (certificate subject CN) for every\nupstream connection to this target. When omitted, Warpgate preserves\nthe authenticated user's identity as `warpgate:<username>`."
           }
         }
       },
