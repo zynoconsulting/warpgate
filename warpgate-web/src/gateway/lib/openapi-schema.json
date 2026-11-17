@@ -2,7 +2,7 @@
   "openapi": "3.0.0",
   "info": {
     "title": "Warpgate HTTP proxy",
-    "version": "v0.30.0-modified"
+    "version": "v0.30.4-124-gf93af8dc"
   },
   "servers": [
     {
@@ -579,9 +579,6 @@
                 }
               }
             }
-          },
-          "401": {
-            "description": ""
           }
         },
         "security": [
@@ -621,9 +618,6 @@
               }
             }
           },
-          "401": {
-            "description": ""
-          },
           "422": {
             "description": "",
             "content": {
@@ -639,9 +633,6 @@
           }
         },
         "security": [
-          {
-            "TokenSecurityScheme": []
-          },
           {
             "CookieSecurityScheme": []
           },
@@ -674,15 +665,9 @@
                 }
               }
             }
-          },
-          "401": {
-            "description": ""
           }
         },
         "security": [
-          {
-            "TokenSecurityScheme": []
-          },
           {
             "CookieSecurityScheme": []
           },
@@ -712,9 +697,6 @@
           "204": {
             "description": ""
           },
-          "401": {
-            "description": ""
-          },
           "403": {
             "description": ""
           },
@@ -723,9 +705,6 @@
           }
         },
         "security": [
-          {
-            "TokenSecurityScheme": []
-          },
           {
             "CookieSecurityScheme": []
           },
@@ -759,17 +738,11 @@
               }
             }
           },
-          "401": {
-            "description": ""
-          },
           "403": {
             "description": ""
           }
         },
         "security": [
-          {
-            "TokenSecurityScheme": []
-          },
           {
             "CookieSecurityScheme": []
           },
@@ -799,9 +772,6 @@
           "204": {
             "description": ""
           },
-          "401": {
-            "description": ""
-          },
           "403": {
             "description": ""
           },
@@ -810,9 +780,6 @@
           }
         },
         "security": [
-          {
-            "TokenSecurityScheme": []
-          },
           {
             "CookieSecurityScheme": []
           },
@@ -845,15 +812,9 @@
                 }
               }
             }
-          },
-          "401": {
-            "description": ""
           }
         },
         "security": [
-          {
-            "TokenSecurityScheme": []
-          },
           {
             "CookieSecurityScheme": []
           },
@@ -883,17 +844,11 @@
           "200": {
             "description": ""
           },
-          "401": {
-            "description": ""
-          },
           "404": {
             "description": ""
           }
         },
         "security": [
-          {
-            "TokenSecurityScheme": []
-          },
           {
             "CookieSecurityScheme": []
           },
@@ -919,9 +874,6 @@
                 }
               }
             }
-          },
-          "401": {
-            "description": ""
           }
         },
         "security": [
@@ -968,18 +920,9 @@
                 }
               }
             }
-          },
-          "403": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
           }
         },
         "security": [
-          {
-            "TokenSecurityScheme": []
-          },
           {
             "CookieSecurityScheme": []
           },
@@ -1007,9 +950,6 @@
         ],
         "responses": {
           "204": {
-            "description": ""
-          },
-          "401": {
             "description": ""
           },
           "404": {
@@ -1104,9 +1044,6 @@
                 }
               }
             }
-          },
-          "401": {
-            "description": ""
           }
         },
         "security": [
@@ -1148,9 +1085,6 @@
                 }
               }
             }
-          },
-          "401": {
-            "description": ""
           },
           "404": {
             "description": ""
@@ -1195,9 +1129,6 @@
                 }
               }
             }
-          },
-          "401": {
-            "description": ""
           },
           "404": {
             "description": ""
@@ -1252,9 +1183,6 @@
                 }
               }
             }
-          },
-          "401": {
-            "description": ""
           }
         },
         "security": [
@@ -1288,9 +1216,6 @@
         ],
         "responses": {
           "204": {
-            "description": ""
-          },
-          "401": {
             "description": ""
           },
           "404": {
@@ -2966,7 +2891,7 @@
     "securitySchemes": {
       "ClusterSecurityScheme": {
         "type": "apiKey",
-        "description": "Requests forwarded by a cluster peer are authenticated by the peer's TLS\nclient certificate at the listener (plus the forwarded user identity\nresolved into the request authorization \u2014 see\n`cluster_request_authorization`). The node id header only lets this scheme\nfire: the checker reads the context that `inject_request_authorization`\nattaches, so a header alone never authenticates.",
+        "description": "Requests forwarded by a cluster peer are authenticated by the peer's TLS\nclient certificate at the listener (plus the forwarded user identity\nresolved into the request authorization — see\n`cluster_request_authorization`). The node id header only lets this scheme\nfire: the checker reads the context that `inject_request_authorization`\nattaches, so a header alone never authenticates.",
         "name": "x-warpgate-cluster-node",
         "in": "header"
       },

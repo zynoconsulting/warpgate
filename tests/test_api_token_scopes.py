@@ -145,14 +145,15 @@ def test_at_least_one_api_is_required(token_owner):
     )
 
 
-def test_user_only_token_cannot_mint_admin_access(token_owner):
-    url, _, _ = token_owner
+def test_user_only_token_cannot_mint_tokens(token_owner):
+    url, session, _ = token_owner
     parent = create_token(token_owner, user_api=True, admin_api=False)
     headers = {"X-Warpgate-Token": parent["secret"]}
     for scopes in (
         {},
         {"user_api": True, "admin_api": True},
         {"user_api": False, "admin_api": True},
+        {"user_api": True, "admin_api": False},
     ):
         response = requests.post(
             f"{url}/@warpgate/api/profile/api-tokens",
@@ -161,24 +162,12 @@ def test_user_only_token_cannot_mint_admin_access(token_owner):
             verify=False,
             timeout=10,
         )
-        assert response.status_code == 403
-    response = requests.post(
-        f"{url}/@warpgate/api/profile/api-tokens",
-        json=token_body(user_api=True, admin_api=False),
-        headers=headers,
-        verify=False,
-        timeout=10,
-    )
-    assert response.status_code == 201
-    child = response.json()
-    assert child["token"]["admin_api"] is False
-    denied = requests.get(
-        f"{url}/@warpgate/admin/api/sessions",
-        headers={"X-Warpgate-Token": child["secret"]},
-        verify=False,
-        timeout=10,
-    )
-    assert denied.status_code == 403
+        # Upstream now requires a browser login for all token creation, even
+        # when the requested replacement would keep the parent's API scopes.
+        assert response.status_code == 401
+    response = session.get(f"{url}/@warpgate/api/profile/api-tokens", timeout=10)
+    response.raise_for_status()
+    assert [token["id"] for token in response.json()] == [parent["token"]["id"]]
 
 
 def test_admin_api_selection_does_not_grant_admin_permissions(token_owner):
