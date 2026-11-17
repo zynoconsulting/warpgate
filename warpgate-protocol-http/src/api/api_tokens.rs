@@ -6,12 +6,10 @@ use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 use warpgate_common::WarpgateError;
 use warpgate_common::helpers::hash::{generate_ticket_secret, hash_secret};
-use warpgate_common_http::RequestAuthorization;
 use warpgate_common_http::errors::bad_request;
 use warpgate_db_entities::ApiToken;
 
-use super::common::get_user;
-use crate::api::auth_scheme::AuthedSession;
+use crate::api::auth_scheme::{FullUser, WebSessionUser};
 
 pub struct Api;
 
@@ -19,8 +17,6 @@ pub struct Api;
 enum GetApiTokensResponse {
     #[oai(status = 200)]
     Ok(Json<Vec<ExistingApiToken>>),
-    #[oai(status = 401)]
-    Unauthorized,
 }
 
 #[derive(Object)]
@@ -72,18 +68,12 @@ enum CreateApiTokenResponse {
     Created(Json<TokenAndSecret>),
     #[oai(status = 400)]
     BadRequest(Json<String>),
-    #[oai(status = 403)]
-    Forbidden,
-    #[oai(status = 401)]
-    Unauthorized,
 }
 
 #[derive(ApiResponse)]
 enum DeleteApiTokenResponse {
     #[oai(status = 204)]
     Deleted,
-    #[oai(status = 401)]
-    Unauthorized,
     #[oai(status = 404)]
     NotFound,
 }
@@ -97,17 +87,10 @@ impl Api {
     )]
     async fn api_get_api_tokens(
         &self,
-        ctx: AuthedSession,
+        ctx: FullUser,
     ) -> Result<GetApiTokensResponse, WarpgateError> {
-        let auth = &ctx.auth;
         let db = &ctx.services().db;
-
-        let Some(full) = auth.as_full_user() else {
-            return Ok(GetApiTokensResponse::Unauthorized);
-        };
-        let Some(user_model) = get_user(&full, db).await? else {
-            return Ok(GetApiTokensResponse::Unauthorized);
-        };
+        let user_model = &ctx.user;
 
         let api_tokens = user_model.find_related(ApiToken::Entity).all(db).await?;
 
@@ -123,32 +106,17 @@ impl Api {
     )]
     async fn api_create_api_token(
         &self,
-        ctx: AuthedSession,
+        ctx: WebSessionUser,
         body: Json<NewApiToken>,
     ) -> Result<CreateApiTokenResponse, WarpgateError> {
-        let auth = &ctx.auth;
         let db = &ctx.services().db;
-
-        let Some(full) = auth.as_full_user() else {
-            return Ok(CreateApiTokenResponse::Unauthorized);
-        };
-        let Some(user_model) = get_user(&full, db).await? else {
-            return Ok(CreateApiTokenResponse::Unauthorized);
-        };
+        let user_model = &ctx.user;
 
         if !body.user_api && !body.admin_api {
             return Ok(CreateApiTokenResponse::BadRequest(bad_request(
                 "Enable at least one API",
             )));
         }
-        // A token must not mint a replacement that restores its disabled APIs.
-        if let RequestAuthorization::UserToken { permissions, .. } = auth
-            && ((body.user_api && !permissions.user_api)
-                || (body.admin_api && !permissions.admin_api))
-        {
-            return Ok(CreateApiTokenResponse::Forbidden);
-        }
-
         let parameters = ctx.parameters().await?;
         if let Some(max_seconds) = parameters.max_api_token_duration_seconds {
             let max_expiry = OffsetDateTime::now_utc() + Duration::seconds(max_seconds);
@@ -187,18 +155,11 @@ impl Api {
     )]
     async fn api_delete_api_token(
         &self,
-        ctx: AuthedSession,
+        ctx: FullUser,
         id: Path<Uuid>,
     ) -> Result<DeleteApiTokenResponse, WarpgateError> {
-        let auth = &ctx.auth;
         let db = &ctx.services().db;
-
-        let Some(full) = auth.as_full_user() else {
-            return Ok(DeleteApiTokenResponse::Unauthorized);
-        };
-        let Some(user_model) = get_user(&full, db).await? else {
-            return Ok(DeleteApiTokenResponse::Unauthorized);
-        };
+        let user_model = &ctx.user;
 
         let Some(model) = user_model
             .find_related(ApiToken::Entity)

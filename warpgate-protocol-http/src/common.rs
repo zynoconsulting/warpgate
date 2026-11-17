@@ -25,13 +25,15 @@ use warpgate_common_http::ext::{construct_external_url, is_navigation_request};
 use warpgate_common_http::logging::get_client_ip_addr;
 use warpgate_common_http::{
     AuthenticatedRequestContext, RequestAuthorization, SessionAuthorization,
-    X_WARPGATE_CLUSTER_IDENTITY, X_WARPGATE_TOKEN, is_cluster_peer_request,
+    X_WARPGATE_CLUSTER_IDENTITY, X_WARPGATE_CLUSTER_IDENTITY_TOKEN, X_WARPGATE_TOKEN,
+    is_cluster_peer_request,
 };
 use warpgate_core::{ConfigProvider, ValidatedApiToken, vet_credential_bearer};
 use warpgate_db_entities::User;
 use warpgate_sso::WarpgateIdToken;
 
 use crate::middleware::{assert_mfa_setup_gate, is_session_bootstrap_path, warpgate_surface_path};
+use crate::path_matcher::endpoint_pattern_matches;
 use crate::session::SessionStore;
 use crate::session_storage::SharedSessionStorage;
 
@@ -479,8 +481,9 @@ pub async fn authorize_session(
 
 /// Authorization for a request from an authenticated cluster peer. The proxying
 /// node forwards the acting user's id in `x-warpgate-cluster-identity` (see
-/// `cluster_proxy::proxy_or_serve`), so the request runs here as that user;
-/// without the header the peer acts as a bare cluster peer. An id that no
+/// `cluster_proxy::proxy_or_serve`), so the request runs here as that user.
+/// `x-warpgate-cluster-identity-token` marks that user as token-authenticated.
+/// Without the identity header the peer acts as a bare cluster peer. An id that no
 /// longer resolves to a user fails closed (unauthenticated).
 async fn cluster_request_authorization(
     ctx: &UnauthenticatedRequestContext,
@@ -492,16 +495,35 @@ async fn cluster_request_authorization(
     let Some(user_id) = header.to_str().ok().and_then(|s| s.parse::<Uuid>().ok()) else {
         return Ok(None);
     };
-    Ok(User::Entity::find_by_id(user_id)
+    let user = User::Entity::find_by_id(user_id)
         .one(&ctx.services().db)
         .await
-        .map_err(poem::error::InternalServerError)?
-        .map(|user| {
-            RequestAuthorization::Session(SessionAuthorization::User {
-                user_id: user.id,
-                username: user.username,
-            })
+        .map_err(poem::error::InternalServerError)?;
+    user.map(|user| forwarded_user_authorization(user.id, user.username, req))
+        .transpose()
+}
+
+fn forwarded_user_authorization(
+    user_id: Uuid,
+    username: String,
+    req: &Request,
+) -> poem::Result<RequestAuthorization> {
+    if let Some(header) = req.headers().get(&X_WARPGATE_CLUSTER_IDENTITY_TOKEN) {
+        // Keep both authentication provenance and the fork's API selections.
+        // A bare upstream marker or malformed permissions must fail closed.
+        let permissions =
+            serde_json::from_slice(header.as_bytes()).map_err(poem::error::BadRequest)?;
+        Ok(RequestAuthorization::UserToken {
+            user_id,
+            username,
+            permissions,
+        })
+    } else {
+        Ok(RequestAuthorization::Session(SessionAuthorization::User {
+            user_id,
+            username,
         }))
+    }
 }
 
 /// Resolves an API token to its user, applying the same account-status checks a
@@ -621,6 +643,27 @@ pub async fn inject_request_authorization<E: Endpoint + 'static>(
         {
             Some(RequestAuthorization::AdminToken)
         } else if let Some(validated) = user_for_api_token(&req, &ctx, token_from_header).await? {
+            let endpoint = format!("{} {}", req.method(), req.uri().path());
+            let allowed = {
+                let config = ctx.services().config.lock().await;
+                config
+                    .store
+                    .http
+                    .user_api_token_allowed_endpoints
+                    .as_ref()
+                    .is_none_or(|list| {
+                        list.iter().any(|e| {
+                            endpoint_pattern_matches(e, req.method().as_str(), req.uri().path())
+                        })
+                    })
+            };
+            if !allowed {
+                tracing::warn!(
+                    session_username = %validated.user.username,
+                    "API token denied for {endpoint}: not in http.user_api_token_allowed_endpoints"
+                );
+                return Err(poem::Error::from_status(StatusCode::FORBIDDEN));
+            }
             Some(RequestAuthorization::UserToken {
                 user_id: validated.user.id,
                 username: validated.user.username,
@@ -674,6 +717,44 @@ pub async fn inject_request_authorization<E: Endpoint + 'static>(
 #[cfg(test)]
 mod tests {
     use super::{StatusCode, gateway_redirect, host_is_subdomain_of_or_equal};
+
+    #[test]
+    fn forwarded_user_keeps_token_permissions_and_session_provenance() {
+        use poem::Request;
+        use uuid::Uuid;
+        use warpgate_common::ApiTokenPermissions;
+        use warpgate_common_http::X_WARPGATE_CLUSTER_IDENTITY_TOKEN;
+
+        let req = Request::builder().finish();
+        let session =
+            super::forwarded_user_authorization(Uuid::nil(), "alice".into(), &req).unwrap();
+        assert!(session.is_session());
+
+        for (user_api, admin_api) in [(true, false), (false, true), (true, true)] {
+            let value = serde_json::to_string(&ApiTokenPermissions {
+                user_api,
+                admin_api,
+            })
+            .unwrap();
+            let req = Request::builder()
+                .header(X_WARPGATE_CLUSTER_IDENTITY_TOKEN.clone(), value)
+                .finish();
+            let auth =
+                super::forwarded_user_authorization(Uuid::nil(), "alice".into(), &req).unwrap();
+            assert!(!auth.is_session());
+            assert_eq!(auth.allows_user_api(), user_api);
+            assert_eq!(auth.allows_admin_api(), admin_api);
+        }
+
+        for value in ["1", "{}", "null", "not-json"] {
+            let req = Request::builder()
+                .header(X_WARPGATE_CLUSTER_IDENTITY_TOKEN.clone(), value)
+                .finish();
+            assert!(
+                super::forwarded_user_authorization(Uuid::nil(), "alice".into(), &req).is_err()
+            );
+        }
+    }
 
     const BROWSER_ACCEPT: &str = "text/html,application/xhtml+xml,*/*;q=0.8";
 
