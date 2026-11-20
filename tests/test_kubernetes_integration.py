@@ -1059,8 +1059,11 @@ class TestKubernetesIntegration:
         self, processes, shared_wg: WarpgateProcess
     ):
         """A WatchList stream (sendInitialEvents) must reach the client with its
-        initial-events-end bookmark. The apiserver gzips it as many members and
-        a decoder that stops after the first one truncates it."""
+        initial-events-end bookmark and the upstream Content-Encoding. Where the
+        apiserver gzips it as many members, a decoder that stops after the first
+        one truncates it; k3s may not compress watches at all, in which case this
+        covers the uncompressed path and the Rust test
+        `watchlist_gzip_members_reach_the_client_whole` covers the gzip one."""
         k3s, user, target_name, url = _provision_kubernetes_target(
             processes, shared_wg, "watchlist"
         )
@@ -1102,9 +1105,10 @@ class TestKubernetesIntegration:
                     timeout=30,
                 )
                 assert resp.status_code == 200, resp.text[:300]
-                return [
+                events = [
                     json.loads(line) for line in resp.iter_lines() if line.strip()
                 ]
+                return events, resp.headers.get("Content-Encoding")
 
             def summarize(events):
                 added = {
@@ -1122,18 +1126,19 @@ class TestKubernetesIntegration:
                 )
                 return added, bookmark
 
-            _, direct_bookmark = summarize(
-                read_events(f"https://127.0.0.1:{k3s.port}", k3s.token)
+            direct_events, direct_encoding = read_events(
+                f"https://127.0.0.1:{k3s.port}", k3s.token
             )
+            _, direct_bookmark = summarize(direct_events)
             if not direct_bookmark:
                 pytest.skip("this k3s does not send the initial-events-end bookmark")
 
-            added, bookmark = summarize(
-                read_events(
-                    f"https://127.0.0.1:{shared_wg.kubernetes_port}/{target_name}",
-                    user_token,
-                )
+            proxied_events, proxied_encoding = read_events(
+                f"https://127.0.0.1:{shared_wg.kubernetes_port}/{target_name}",
+                user_token,
             )
+            added, bookmark = summarize(proxied_events)
+            assert proxied_encoding == direct_encoding
             assert set(names) <= added
             assert bookmark, "initial-events-end bookmark missing: stream truncated"
         finally:
