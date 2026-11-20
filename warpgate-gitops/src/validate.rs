@@ -276,6 +276,13 @@ pub fn check_document(doc: &Document) -> (Option<Resource>, Vec<Diagnostic>) {
         for (path, message) in malformed.chain(located) {
             diagnostics.push(Diagnostic::new(doc.value_location(&path), path, message));
         }
+        // Checks the admin API applies outside poem's validators
+        if let TargetOptions::Kubernetes(kubernetes) = options
+            && let Err(message) = kubernetes.validate()
+        {
+            let path = Path::keys(&["spec", "options", "kubernetes", "auth"]);
+            diagnostics.push(Diagnostic::new(doc.value_location(&path), path, message));
+        }
     }
 
     if let Resource::SshClientKey(key) = &resource {

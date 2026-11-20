@@ -1,0 +1,2 @@
+tests/fixtures/invalid/kubernetes-ephemeral.yaml:10:9 spec.options.kubernetes.auth: Kubernetes ephemeral certificate validity must be between 60 and 600 seconds
+tests/fixtures/invalid/kubernetes-ephemeral.yaml:22:9 spec.options.kubernetes.auth: Kubernetes ephemeral certificate username must be non-empty and must not start with `system:`
