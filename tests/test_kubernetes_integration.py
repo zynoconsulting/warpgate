@@ -1037,7 +1037,12 @@ class TestKubernetesIntegration:
         resp = requests.get(
             f"https://127.0.0.1:{shared_wg.kubernetes_port}/{target_name}"
             f"/api/v1/namespaces/{namespace}/configmaps",
-            headers={"Authorization": f"Bearer {user_token}"},
+            headers={
+                "Authorization": f"Bearer {user_token}",
+                # Without this the 4 MiB of "x" gzips to almost nothing and
+                # no longer exercises the over-limit streaming path.
+                "Accept-Encoding": "identity",
+            },
             verify=False,
         )
         assert resp.status_code == 200, resp.text[:300]
@@ -1048,6 +1053,93 @@ class TestKubernetesIntegration:
             if item["metadata"]["name"].startswith("big-")
         ]
         assert payloads == [payload] * 5
+
+    @pytest.mark.asyncio
+    async def test_watchlist_arrives_whole_through_warpgate(
+        self, processes, shared_wg: WarpgateProcess
+    ):
+        """A WatchList stream (sendInitialEvents) must reach the client with its
+        initial-events-end bookmark. The apiserver gzips it as many members and
+        a decoder that stops after the first one truncates it."""
+        k3s, user, target_name, url = _provision_kubernetes_target(
+            processes, shared_wg, "watchlist"
+        )
+        user_token = await _issue_user_token(url, user, "watchlist-token")
+
+        namespace = f"watchlist-{uuid.uuid4().hex[:8]}"
+        names = [f"cm-{index}" for index in range(20)]
+        k3s.kubectl(["create", "namespace", namespace])
+        try:
+            for name in names:
+                k3s.kubectl(
+                    ["create", "-f", "-"],
+                    input=json.dumps(
+                        {
+                            "apiVersion": "v1",
+                            "kind": "ConfigMap",
+                            "metadata": {"name": name, "namespace": namespace},
+                            "data": {"k": "v"},
+                        }
+                    ).encode(),
+                )
+
+            path = (
+                f"/api/v1/namespaces/{namespace}/configmaps"
+                "?watch=true&sendInitialEvents=true"
+                "&resourceVersionMatch=NotOlderThan"
+                "&allowWatchBookmarks=true&timeoutSeconds=5"
+            )
+
+            def read_events(base, token):
+                resp = requests.get(
+                    base + path,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept-Encoding": "gzip",
+                    },
+                    verify=False,
+                    stream=True,
+                    timeout=30,
+                )
+                assert resp.status_code == 200, resp.text[:300]
+                return [
+                    json.loads(line) for line in resp.iter_lines() if line.strip()
+                ]
+
+            def summarize(events):
+                added = {
+                    e["object"]["metadata"]["name"]
+                    for e in events
+                    if e["type"] == "ADDED"
+                }
+                bookmark = any(
+                    e["type"] == "BOOKMARK"
+                    and e["object"]["metadata"]
+                    .get("annotations", {})
+                    .get("k8s.io/initial-events-end")
+                    == "true"
+                    for e in events
+                )
+                return added, bookmark
+
+            _, direct_bookmark = summarize(
+                read_events(f"https://127.0.0.1:{k3s.port}", k3s.token)
+            )
+            if not direct_bookmark:
+                pytest.skip("this k3s does not send the initial-events-end bookmark")
+
+            added, bookmark = summarize(
+                read_events(
+                    f"https://127.0.0.1:{shared_wg.kubernetes_port}/{target_name}",
+                    user_token,
+                )
+            )
+            assert set(names) <= added
+            assert bookmark, "initial-events-end bookmark missing: stream truncated"
+        finally:
+            k3s.kubectl(
+                ["delete", "namespace", namespace, "--wait=false"], check=False
+            )
 
     @pytest.mark.asyncio
     async def test_kubectl_run(self, processes, shared_wg: WarpgateProcess):
