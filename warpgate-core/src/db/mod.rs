@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Expr, ExprTrait};
 use sea_orm::{
     ColumnTrait, ConnectOptions, Database, DatabaseConnection, DbErr, EntityOrSelect, EntityTrait,
     QueryFilter, QuerySelect, SqlErr,
@@ -118,6 +118,10 @@ pub async fn migrate_all(connection: &DatabaseConnection) -> Result<()> {
     Ok(())
 }
 
+pub async fn has_pending_migrations(connection: &DatabaseConnection) -> Result<bool> {
+    Ok(warpgate_db_migrations::has_pending_migrations(connection).await?)
+}
+
 /// Apply `steps` pending migrations.
 pub async fn migrate_up(connection: &DatabaseConnection, steps: u32) -> Result<()> {
     migrate_database_up(connection, steps).await?;
@@ -137,12 +141,17 @@ pub async fn cleanup_db(
     audit_retention: &Duration,
 ) -> Result<()> {
     use warpgate_db_entities::{
-        LogEntry, Recording, SessionApprovalRequest, Ticket, TicketRequest,
+        LogEntry, ProviderSync, Recording, SessionApprovalRequest, Ticket, TicketRequest,
     };
     let audit_cutoff = OffsetDateTime::now_utc() - time::Duration::try_from(*audit_retention)?;
     let recording_cutoff = OffsetDateTime::now_utc() - time::Duration::try_from(*retention)?;
 
     SessionApprovalRequest::delete_all_before(db, audit_cutoff).await?;
+
+    ProviderSync::Entity::delete_many()
+        .filter(Expr::col(ProviderSync::Column::CheckedAt).lt(audit_cutoff))
+        .exec(db)
+        .await?;
 
     LogEntry::Entity::delete_many()
         .filter(Expr::col(LogEntry::Column::Target).eq("audit"))
@@ -255,6 +264,7 @@ mod tests {
     use sea_orm::ActiveValue::Set;
     use sea_orm::{Database, EntityTrait, PaginatorTrait};
     use uuid::Uuid;
+    use warpgate_common::UserId;
     use warpgate_db_entities::HttpSession;
     use warpgate_db_entities::Parameters::{ConfigMigrationValues, set_config_migration_values};
     use warpgate_db_migrations::migrate_database;
@@ -262,13 +272,13 @@ mod tests {
     use super::*;
 
     async fn open_session(db: &DatabaseConnection, node_id: Option<Uuid>) -> Uuid {
-        open_session_for_user(db, node_id, Uuid::new_v4()).await
+        open_session_for_user(db, node_id, UserId(Uuid::new_v4())).await
     }
 
     async fn open_session_for_user(
         db: &DatabaseConnection,
         node_id: Option<Uuid>,
-        user_id: Uuid,
+        user_id: UserId,
     ) -> Uuid {
         let id = Uuid::new_v4();
         UserSession::Entity::insert(UserSession::ActiveModel {
@@ -325,5 +335,34 @@ mod tests {
             );
         }
         assert_eq!(HttpSession::Entity::find().count(&db).await.unwrap(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_target_deletes_all_succeed() {
+        use crate::resources::{Actor, targets};
+
+        set_config_migration_values(ConfigMigrationValues::default());
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}/db.sqlite3?mode=rwc", dir.path().display());
+        let db = connect_to_sqlite(&url).await.unwrap();
+        migrate_database(&db).await.unwrap();
+
+        let mut ids = vec![];
+        for i in 0..20 {
+            let data = crate::resources::tests::target(
+                &format!("t{i}"),
+                serde_json::json!({"ssh": {"host": format!("h{i}")}}),
+            );
+            let target = targets::create(&db, Actor::Admin, &data).await.unwrap();
+            ids.push(target.id);
+        }
+
+        let deletes = ids.into_iter().map(|id| {
+            let db = db.clone();
+            tokio::spawn(async move { targets::delete(&db, Actor::Admin, id).await })
+        });
+        for result in futures::future::join_all(deletes).await {
+            result.unwrap().unwrap();
+        }
     }
 }

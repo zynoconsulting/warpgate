@@ -16,7 +16,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
-use warpgate_common::WarpgateError;
+use warpgate_common::{TargetId, UserId, WarpgateError};
 use warpgate_db_entities::Ticket;
 
 use crate::state::WeakSessionHandle;
@@ -99,8 +99,8 @@ pub(crate) fn default_timing() -> (Duration, Duration) {
 pub enum AccessGrant {
     Ticket {
         ticket_id: Uuid,
-        user_id: Uuid,
-        target_id: Uuid,
+        user_id: UserId,
+        target_id: TargetId,
     },
 }
 
@@ -314,12 +314,14 @@ mod tests {
     /// A migrated in-memory DB with one user, one target, and one ticket for
     /// it — the liveness table below only varies the ticket's own fields, or
     /// the user/target ids it's checked against.
-    async fn fixture(expiry: Option<OffsetDateTime>) -> (DatabaseConnection, Uuid, Uuid, Uuid) {
+    async fn fixture(
+        expiry: Option<OffsetDateTime>,
+    ) -> (DatabaseConnection, Uuid, UserId, TargetId) {
         set_config_migration_values(ConfigMigrationValues::default());
         let db = Database::connect("sqlite::memory:").await.unwrap();
         warpgate_db_migrations::migrate_database(&db).await.unwrap();
 
-        let user_id = Uuid::new_v4();
+        let user_id = UserId(Uuid::new_v4());
         e::User::ActiveModel {
             id: Set(user_id),
             username: Set("alice".into()),
@@ -329,12 +331,13 @@ mod tests {
             ldap_server_id: Set(None),
             ldap_object_uuid: Set(None),
             allowed_ip_ranges: Set(serde_json::Value::Null),
+            provider: Set(None),
         }
         .insert(&db)
         .await
         .unwrap();
 
-        let target_id = Uuid::new_v4();
+        let target_id = TargetId(Uuid::new_v4());
         e::Target::ActiveModel {
             id: Set(target_id),
             name: Set("web".into()),
@@ -348,6 +351,7 @@ mod tests {
             ticket_require_approval: Set(false),
             ticket_max_uses: Set(None),
             require_approval: Set(false),
+            provider: Set(None),
         }
         .insert(&db)
         .await
@@ -435,7 +439,7 @@ mod tests {
         let (db, ticket_id, user_id, target_id) = fixture(None).await;
         let wrong_user = AccessGrant::Ticket {
             ticket_id,
-            user_id: Uuid::new_v4(),
+            user_id: UserId(Uuid::new_v4()),
             target_id,
         };
         assert!(matches!(
@@ -445,7 +449,7 @@ mod tests {
         let wrong_target = AccessGrant::Ticket {
             ticket_id,
             user_id,
-            target_id: Uuid::new_v4(),
+            target_id: TargetId(Uuid::new_v4()),
         };
         assert!(matches!(
             wrong_target.check(&db, now).await.unwrap(),

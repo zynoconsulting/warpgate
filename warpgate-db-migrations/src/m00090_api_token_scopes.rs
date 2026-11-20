@@ -59,7 +59,7 @@ mod tests {
         Migration.up(&manager).await?;
 
         let rows = db
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 db.get_database_backend(),
                 "SELECT secret_hash, user_api, admin_api FROM api_tokens",
             ))

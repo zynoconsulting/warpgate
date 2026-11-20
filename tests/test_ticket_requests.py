@@ -1,3 +1,4 @@
+import pytest
 import requests
 from uuid import uuid4
 
@@ -76,18 +77,21 @@ class TestTicketRequests:
         assert resp.status_code // 100 == 2
         return session
 
-    def test_request_targets_expose_effective_duration_limit(
+    @pytest.mark.parametrize("target_limit", [1800, None])
+    def test_request_targets_expose_target_duration_limit(
         self,
         echo_server_port,
         shared_wg: WarpgateProcess,
+        target_limit,
     ):
-        """The request form receives the selected target's effective cap."""
+        """The request form gets the target's own cap; null means the global
+        one from /info applies."""
         url = f"https://localhost:{shared_wg.http_port}"
         with admin_client(url) as api:
             user, target, _ = self._setup_user_and_target(
                 api,
                 echo_server_port,
-                ticket_max_duration_seconds=1800,
+                ticket_max_duration_seconds=target_limit,
             )
             api.update_parameters(
                 _default_params(
@@ -103,7 +107,7 @@ class TestTicketRequests:
             returned_target = next(
                 item for item in response.json() if item["id"] == str(target.id)
             )
-            assert returned_target["ticket_max_duration_seconds"] == 1800
+            assert returned_target["ticket_max_duration_seconds"] == target_limit
         finally:
             _disable_self_service(url)
 

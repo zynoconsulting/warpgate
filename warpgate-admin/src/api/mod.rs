@@ -4,6 +4,7 @@ mod admin_roles;
 mod certificate_credentials;
 pub mod cluster_notifications;
 pub mod cluster_proxy;
+mod gitops;
 mod instance_ca;
 mod secret_backends;
 // The per-permission `require` gate, `PermissionGranted`, and the cluster variant are consumed
@@ -14,9 +15,11 @@ mod admin_scheme;
 pub(crate) mod common;
 pub(crate) use admin_scheme::{AdminContext, ClusterOrAdminContext, guard_user_mutation};
 pub use common::admin_permission_set;
+pub use limited_json::SELF_LIMITED_ROUTES;
 mod known_hosts_detail;
 mod known_hosts_list;
 mod ldap_servers;
+mod limited_json;
 mod login_protection;
 mod logs;
 mod network_status;
@@ -93,6 +96,6 @@ pub fn get() -> impl OpenApi {
             certificate_credentials::DetailApi,
             instance_ca::Api,
         ),
-        secret_backends::Api,
+        (secret_backends::Api, gitops::Api),
     )
 }

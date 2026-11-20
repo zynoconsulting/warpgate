@@ -15,7 +15,7 @@ use warpgate_common::auth::{
     AuthCredential, AuthResult, AuthState, AuthStateUserInfo, CredentialKind,
 };
 use warpgate_common::{
-    Protocol, Secret, Target, TargetKubernetesOptions, TargetOptions, User,
+    Protocol, Secret, Target, TargetId, TargetKubernetesOptions, TargetOptions, User,
     UserRequireCredentialsPolicy, UserSessionId, WarpgateError,
 };
 use warpgate_common_http::authorization_token;
@@ -674,7 +674,7 @@ async fn user_for_username(services: &Services, username: &str) -> poem::Result<
 pub(crate) async fn create_authenticated_client(
     k8s_options: &TargetKubernetesOptions,
     user_info: &AuthStateUserInfo,
-    target_id: Uuid,
+    target_id: TargetId,
     upstream_certificate_cache: &EphemeralKubernetesIdentityCache,
     services: &Services,
 ) -> anyhow::Result<reqwest::ClientBuilder> {
@@ -816,7 +816,7 @@ async fn ephemeral_kubernetes_client_identity(
     validity_seconds: u32,
     configured_username: Option<&str>,
     user_info: &AuthStateUserInfo,
-    target_id: Uuid,
+    target_id: TargetId,
     cache: &EphemeralKubernetesIdentityCache,
     services: &Services,
 ) -> anyhow::Result<String> {
