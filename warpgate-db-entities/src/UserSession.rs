@@ -1,12 +1,13 @@
+use warpgate_common::UserId;
 use sea_orm::entity::prelude::*;
 use sea_orm::sea_query::{Expr, IntoCondition};
-use sea_orm::{DatabaseTransaction, QuerySelect, TransactionTrait};
+use sea_orm::{DatabaseTransaction, QuerySelect};
 use time::OffsetDateTime;
 use tracing::error;
 use uuid::Uuid;
 use warpgate_common::{NodeId, UserSessionId, WarpgateError};
 
-use crate::{HttpSession, SessionApprovalRequest, TargetSession};
+use crate::{HttpSession, SessionApprovalRequest, TargetSession, begin_write};
 
 /// A top level session object, one per protocol login.
 /// This is what WarpgateServerHandle corresponds to
@@ -16,7 +17,7 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: UserSessionId,
     pub username: Option<String>,
-    pub user_id: Option<Uuid>,
+    pub user_id: Option<UserId>,
     pub remote_address: String,
     pub started: OffsetDateTime,
     pub ended: Option<OffsetDateTime>,
@@ -56,7 +57,7 @@ impl ActiveModelBehavior for ActiveModel {}
 pub struct EndedTargetSessions {
     id: UserSessionId,
     children: Vec<TargetSession::Model>,
-    user_id: Option<Uuid>,
+    user_id: Option<UserId>,
     username: Option<String>,
 }
 
@@ -94,7 +95,7 @@ pub async fn lock_for_update(
     id: UserSessionId,
 ) -> Result<Option<Model>, WarpgateError> {
     Entity::update_many()
-        .col_expr(Column::Started, Expr::col(Column::Started).into())
+        .col_expr(Column::Started, Expr::col(Column::Started))
         .filter(Column::Id.eq(id))
         .exec(transaction)
         .await?;
@@ -148,7 +149,7 @@ pub async fn mark_ended_including_target_sessions(
     db: &DatabaseConnection,
     id: UserSessionId,
 ) -> Result<(), WarpgateError> {
-    let transaction = db.begin().await?;
+    let transaction = begin_write(db).await?;
     let ended = mark_ended_in_transaction(&transaction, id).await?;
     transaction.commit().await?;
     ended.settle(db).await;
@@ -157,7 +158,7 @@ pub async fn mark_ended_including_target_sessions(
 
 /// The definite way to close a session
 pub async fn revoke(db: &DatabaseConnection, id: UserSessionId) -> Result<(), WarpgateError> {
-    let transaction = db.begin().await?;
+    let transaction = begin_write(db).await?;
     let ended = mark_ended_in_transaction(&transaction, id).await?;
     HttpSession::Entity::delete_many()
         .filter(HttpSession::Column::UserSessionId.eq(id))

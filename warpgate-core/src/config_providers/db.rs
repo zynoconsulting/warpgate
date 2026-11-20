@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use data_encoding::BASE64;
-use sea_orm::sea_query::{Expr, Func, IntoIden, Query};
+use sea_orm::sea_query::{Expr, ExprTrait, Func, IntoIden, Query};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
     EntityTrait, ModelTrait, QueryFilter, QueryOrder, Set,
@@ -17,8 +17,8 @@ use warpgate_common::auth::{
 use warpgate_common::helpers::hash::{hash_secret, verify_password_hash};
 use warpgate_common::helpers::otp::verify_totp;
 use warpgate_common::{
-    ApiTokenPermissions, Protocol, Target, User, UserAuthCredential, UserPublicKeyCredential,
-    UserRequireCredentialsPolicy, UserSsoCredential, WarpgateError,
+    ApiTokenPermissions, Protocol, Target, TargetId, User, UserAuthCredential, UserId,
+    UserPublicKeyCredential, UserRequireCredentialsPolicy, UserSsoCredential, WarpgateError,
 };
 use warpgate_db_entities as entities;
 use warpgate_sso::SsoProviderConfig;
@@ -92,10 +92,7 @@ trait SelectExists {
 impl SelectExists for sea_orm::sea_query::SelectStatement {
     async fn exists(&mut self, db: &DatabaseConnection) -> Result<bool, WarpgateError> {
         self.expr(Expr::val(1)).limit(1);
-        Ok(db
-            .query_one(db.get_database_backend().build(&*self))
-            .await?
-            .is_some())
+        Ok(db.query_one(&*self).await?.is_some())
     }
 }
 
@@ -109,7 +106,7 @@ struct SshKeySync {
 /// LDAP keys need reconcillation because key IDs are used for approval bypass matching
 async fn reconcile_ldap_ssh_keys(
     db: &DatabaseConnection,
-    user_id: Uuid,
+    user_id: UserId,
     desired: HashSet<String>,
 ) -> Result<SshKeySync, WarpgateError> {
     let existing = entities::PublicKeyCredential::Entity::find()
@@ -167,7 +164,7 @@ impl DatabaseConfigProvider {
     async fn sync_ldap_ssh_keys(
         &self,
         db: &DatabaseConnection,
-        user_id: Uuid,
+        user_id: UserId,
         ldap_server_id: Uuid,
         ldap_object_uuid: &Uuid,
     ) -> Result<(), WarpgateError> {
@@ -294,7 +291,7 @@ impl DatabaseConfigProvider {
             error!(
                 "Cannot auto-create SSO user with username {preferred_username} because it already exists and does not have a matching SSO credential."
             );
-            return Err(WarpgateError::UserAlreadyExists(preferred_username));
+            return Err(WarpgateError::NameTaken);
         }
 
         let default_credential_policy = match default_credential_policy {
@@ -306,7 +303,7 @@ impl DatabaseConfigProvider {
         };
 
         let user = entities::User::ActiveModel {
-            id: Set(Uuid::new_v4()),
+            id: Set(UserId(Uuid::new_v4())),
             username: Set(preferred_username.clone()),
             description: Set("".into()),
             credential_policy: Set(default_credential_policy),
@@ -314,6 +311,7 @@ impl DatabaseConfigProvider {
             ldap_server_id: Set(ldap_server_id),
             ldap_object_uuid: Set(ldap_object_uuid),
             allowed_ip_ranges: Set(serde_json::Value::Null),
+            ..Default::default()
         }
         .insert(db)
         .await?;
@@ -396,7 +394,7 @@ impl ConfigProvider for DatabaseConfigProvider {
             .map_err(Into::into)
     }
 
-    async fn get_target_by_id(&self, id: Uuid) -> Result<Option<Target>, WarpgateError> {
+    async fn get_target_by_id(&self, id: TargetId) -> Result<Option<Target>, WarpgateError> {
         entities::Target::Entity::find_by_id(id)
             .one(&self.db)
             .await?
@@ -417,6 +415,12 @@ impl ConfigProvider for DatabaseConfigProvider {
             }
             DatabaseBackend::Postgres => Expr::cust(r"options->'http'->>'external_host'"),
             DatabaseBackend::Sqlite => Expr::cust(r"json_extract(options, '$.http.external_host')"),
+            backend => {
+                return Err(sea_orm::DbErr::Custom(format!(
+                    "unsupported database backend: {backend:?}"
+                ))
+                .into());
+            }
         };
 
         let target = entities::Target::Entity::find()
@@ -800,8 +804,8 @@ impl ConfigProvider for DatabaseConfigProvider {
 
     async fn authorize_target_by_id(
         &self,
-        user_id: Uuid,
-        target_id: Uuid,
+        user_id: UserId,
+        target_id: TargetId,
     ) -> Result<bool, WarpgateError> {
         active_role_assignment_query()
             .and_where(
@@ -822,7 +826,10 @@ impl ConfigProvider for DatabaseConfigProvider {
             .await
     }
 
-    async fn authorized_target_ids(&self, user_id: Uuid) -> Result<HashSet<Uuid>, WarpgateError> {
+    async fn authorized_target_ids(
+        &self,
+        user_id: UserId,
+    ) -> Result<HashSet<TargetId>, WarpgateError> {
         let query = active_role_assignment_query()
             .column((
                 entities::TargetRoleAssignment::Entity,
@@ -839,11 +846,11 @@ impl ConfigProvider for DatabaseConfigProvider {
             .to_owned();
 
         self.db
-            .query_all(self.db.get_database_backend().build(&query))
+            .query_all(&query)
             .await?
             .iter()
             .map(|row| row.try_get_by_index(0))
-            .collect::<Result<HashSet<Uuid>, _>>()
+            .collect::<Result<HashSet<TargetId>, _>>()
             .map_err(Into::into)
     }
 
@@ -1090,7 +1097,7 @@ mod tests {
 
     async fn user_with_password(db: &DatabaseConnection, username: &str, password: &str) {
         let user = entities::User::ActiveModel {
-            id: Set(Uuid::new_v4()),
+            id: Set(UserId(Uuid::new_v4())),
             username: Set(username.to_owned()),
             description: Set(String::new()),
             credential_policy: Set(serde_json::json!(null)),
@@ -1110,9 +1117,9 @@ mod tests {
         .unwrap();
     }
 
-    async fn user_with_key(db: &DatabaseConnection, key: &str) -> (Uuid, Uuid) {
+    async fn user_with_key(db: &DatabaseConnection, key: &str) -> (UserId, Uuid) {
         let user = entities::User::ActiveModel {
-            id: Set(Uuid::new_v4()),
+            id: Set(UserId(Uuid::new_v4())),
             username: Set("ldap-user".to_owned()),
             description: Set(String::new()),
             credential_policy: Set(serde_json::json!(null)),
@@ -1197,9 +1204,9 @@ mod tests {
         );
     }
 
-    async fn user_named(db: &DatabaseConnection, username: &str) -> Uuid {
+    async fn user_named(db: &DatabaseConnection, username: &str) -> UserId {
         entities::User::ActiveModel {
-            id: Set(Uuid::new_v4()),
+            id: Set(UserId(Uuid::new_v4())),
             username: Set(username.to_owned()),
             description: Set(String::new()),
             credential_policy: Set(serde_json::json!(null)),
@@ -1211,7 +1218,7 @@ mod tests {
         .id
     }
 
-    async fn add_key(db: &DatabaseConnection, user_id: Uuid, key: &str) -> Uuid {
+    async fn add_key(db: &DatabaseConnection, user_id: UserId, key: &str) -> Uuid {
         entities::PublicKeyCredential::ActiveModel {
             id: Set(Uuid::new_v4()),
             user_id: Set(user_id),
@@ -1439,7 +1446,7 @@ mod tests {
         migrate_database(&db).await.unwrap();
 
         entities::User::ActiveModel {
-            id: Set(Uuid::new_v4()),
+            id: Set(UserId(Uuid::new_v4())),
             username: Set("oidc-user".to_owned()),
             description: Set(String::new()),
             credential_policy: Set(serde_json::json!({ "kubernetes": ["sso"] })),

@@ -463,7 +463,10 @@ mod tests {
     use uuid::Uuid;
     use warpgate_common::auth::AuthStateUserInfo;
     use warpgate_common::helpers::hash::hash_secret;
-    use warpgate_common::{DatabaseTargetAuth, Target, TargetOptions, TargetPostgresOptions, Tls};
+    use warpgate_common::{
+        DatabaseTargetAuth, RoleId, Target, TargetId, TargetOptions, TargetPostgresOptions, Tls,
+        UserId,
+    };
     use warpgate_db_entities as e;
     use warpgate_db_entities::Parameters::{ConfigMigrationValues, set_config_migration_values};
 
@@ -472,7 +475,7 @@ mod tests {
 
     fn postgres_target() -> Target {
         Target {
-            id: Uuid::new_v4(),
+            id: TargetId(Uuid::new_v4()),
             name: "pg".into(),
             description: String::new(),
             allow_roles: vec![],
@@ -493,19 +496,20 @@ mod tests {
             ticket_require_approval: false,
             require_approval: false,
             ticket_max_uses: None,
+            provider: None,
         }
     }
 
     /// A migrated database with `services` wired to it, one user and one
     /// Postgres target, so every test here differs only in the role/ticket
     /// rows it adds on top.
-    async fn db_fixture() -> (DatabaseConnection, Services, Target, Uuid) {
+    async fn db_fixture() -> (DatabaseConnection, Services, Target, UserId) {
         set_config_migration_values(ConfigMigrationValues::default());
         let db = Database::connect("sqlite::memory:").await.unwrap();
         warpgate_db_migrations::migrate_database(&db).await.unwrap();
         let services = test_services(&db).await;
 
-        let user_id = Uuid::new_v4();
+        let user_id = UserId(Uuid::new_v4());
         e::User::ActiveModel {
             id: Set(user_id),
             username: Set("alice".into()),
@@ -515,6 +519,7 @@ mod tests {
             ldap_server_id: Set(None),
             ldap_object_uuid: Set(None),
             allowed_ip_ranges: Set(serde_json::Value::Null),
+            provider: Set(None),
         }
         .insert(&db)
         .await
@@ -534,6 +539,7 @@ mod tests {
             ticket_require_approval: Set(false),
             ticket_max_uses: Set(None),
             require_approval: Set(false),
+            provider: Set(None),
         }
         .insert(&db)
         .await
@@ -544,13 +550,14 @@ mod tests {
 
     /// Grants `user_id` a role authorizing `target_id`, through a fresh role
     /// created just for this assignment.
-    async fn grant_role(db: &DatabaseConnection, user_id: Uuid, target_id: Uuid) {
-        let role_id = Uuid::new_v4();
+    async fn grant_role(db: &DatabaseConnection, user_id: UserId, target_id: TargetId) {
+        let role_id = RoleId(Uuid::new_v4());
         e::Role::ActiveModel {
             id: Set(role_id),
             name: Set(format!("role-{role_id}")),
             description: Set(String::new()),
             is_default: Set(false),
+            provider: Set(None),
         }
         .insert(db)
         .await
@@ -578,8 +585,8 @@ mod tests {
     /// left, returning its id.
     async fn insert_self_service_ticket(
         db: &DatabaseConnection,
-        user_id: Uuid,
-        target_id: Uuid,
+        user_id: UserId,
+        target_id: TargetId,
     ) -> Uuid {
         let ticket_id = Uuid::new_v4();
         e::Ticket::ActiveModel {
@@ -599,7 +606,7 @@ mod tests {
         ticket_id
     }
 
-    fn identity_for(user_id: Uuid, protocol: Protocol) -> AuthorizedIdentity {
+    fn identity_for(user_id: UserId, protocol: Protocol) -> AuthorizedIdentity {
         AuthorizedIdentity::for_authenticated_session(
             AuthStateUserInfo {
                 id: user_id,

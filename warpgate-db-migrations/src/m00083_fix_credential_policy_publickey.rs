@@ -40,6 +40,11 @@ impl MigrationTrait for Migration {
                 )
                 .await?;
             }
+            backend => {
+                return Err(DbErr::Migration(format!(
+                    "unsupported database backend: {backend:?}"
+                )));
+            }
         }
 
         Ok(())

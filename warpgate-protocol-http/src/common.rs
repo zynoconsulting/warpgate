@@ -18,7 +18,7 @@ use tracing::Instrument;
 use uuid::Uuid;
 use warpgate_common::auth::{AuthResult, AuthState, AuthStateUserInfo, CredentialKind};
 use warpgate_common::helpers::username::username_eq_ci;
-use warpgate_common::{Protocol, UserSessionId, WarpgateError};
+use warpgate_common::{Protocol, UserId, UserSessionId, WarpgateError};
 use warpgate_common_http::auth::UnauthenticatedRequestContext;
 pub use warpgate_common_http::auth::is_localhost_host;
 use warpgate_common_http::ext::{construct_external_url, is_navigation_request};
@@ -495,7 +495,7 @@ async fn cluster_request_authorization(
     let Some(user_id) = header.to_str().ok().and_then(|s| s.parse::<Uuid>().ok()) else {
         return Ok(None);
     };
-    let user = User::Entity::find_by_id(user_id)
+    let user = User::Entity::find_by_id(UserId(user_id))
         .one(&ctx.services().db)
         .await
         .map_err(poem::error::InternalServerError)?;
@@ -504,7 +504,7 @@ async fn cluster_request_authorization(
 }
 
 fn forwarded_user_authorization(
-    user_id: Uuid,
+    user_id: UserId,
     username: String,
     req: &Request,
 ) -> poem::Result<RequestAuthorization> {
@@ -716,6 +716,8 @@ pub async fn inject_request_authorization<E: Endpoint + 'static>(
 
 #[cfg(test)]
 mod tests {
+    use warpgate_common::UserId;
+
     use super::{StatusCode, gateway_redirect, host_is_subdomain_of_or_equal};
 
     #[test]
@@ -727,7 +729,7 @@ mod tests {
 
         let req = Request::builder().finish();
         let session =
-            super::forwarded_user_authorization(Uuid::nil(), "alice".into(), &req).unwrap();
+            super::forwarded_user_authorization(UserId(Uuid::nil()), "alice".into(), &req).unwrap();
         assert!(session.is_session());
 
         for (user_api, admin_api) in [(true, false), (false, true), (true, true)] {
@@ -740,7 +742,8 @@ mod tests {
                 .header(X_WARPGATE_CLUSTER_IDENTITY_TOKEN.clone(), value)
                 .finish();
             let auth =
-                super::forwarded_user_authorization(Uuid::nil(), "alice".into(), &req).unwrap();
+                super::forwarded_user_authorization(UserId(Uuid::nil()), "alice".into(), &req)
+                    .unwrap();
             assert!(!auth.is_session());
             assert_eq!(auth.allows_user_api(), user_api);
             assert_eq!(auth.allows_admin_api(), admin_api);
@@ -751,7 +754,8 @@ mod tests {
                 .header(X_WARPGATE_CLUSTER_IDENTITY_TOKEN.clone(), value)
                 .finish();
             assert!(
-                super::forwarded_user_authorization(Uuid::nil(), "alice".into(), &req).is_err()
+                super::forwarded_user_authorization(UserId(Uuid::nil()), "alice".into(), &req)
+                    .is_err()
             );
         }
     }

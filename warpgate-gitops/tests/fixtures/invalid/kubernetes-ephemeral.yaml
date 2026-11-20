@@ -1,0 +1,23 @@
+apiVersion: warpgate/v1
+kind: Target
+metadata:
+  name: too-long
+spec:
+  options:
+    kubernetes:
+      cluster_url: https://k8s.internal:6443
+      auth:
+        kind: ephemeral_certificate
+        validity_seconds: 3600
+---
+apiVersion: warpgate/v1
+kind: Target
+metadata:
+  name: system-user
+spec:
+  options:
+    kubernetes:
+      cluster_url: https://k8s.internal:6443
+      auth:
+        kind: ephemeral_certificate
+        username: "system:kube-scheduler"
