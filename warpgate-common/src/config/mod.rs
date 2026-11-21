@@ -221,7 +221,7 @@ pub struct AdminRole {
     pub ticket_requests_manage: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, JsonSchema, strum::EnumIter)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum AdminPermission {
     TargetsCreate,
@@ -537,6 +537,7 @@ pub struct HttpConfig {
     pub listen: ListenEndpoint,
 
     /// Accept HAProxy PROXY protocol v1/v2 headers from the listener's peer.
+    /// Other cluster nodes connect directly and are exempt
     #[serde(default)]
     pub proxy_protocol: bool,
 
@@ -939,6 +940,10 @@ pub struct WarpgateConfigStore {
     #[serde(default)]
     pub external_host: Option<String>,
 
+    /// For SQLite, `sqlite:<directory>`: the database is
+    /// `<directory>/db.sqlite3`, relative to the config file's directory.
+    /// As in any URL, write `%`, `?` and `#` in the path as `%25`, `%3F` and
+    /// `%23`.
     #[serde(default = "_default_database_url")]
     #[schemars(with = "String")]
     pub database_url: Secret<String>,

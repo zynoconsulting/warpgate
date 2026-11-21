@@ -10378,8 +10378,6 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vnc-rs"
 version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a6306bed7ebbdcc80c44c838a1c0496b589e496bb3b3750a1ed97d4eb26f4cf"
 dependencies = [
  "aes 0.8.4",
  "async_io_stream",
@@ -10463,6 +10461,7 @@ dependencies = [
  "data-encoding",
  "dialoguer",
  "dotenv",
+ "dunce",
  "enum_dispatch",
  "futures",
  "humantime",
@@ -10722,6 +10721,7 @@ dependencies = [
  "ipnet",
  "ldap3",
  "packet",
+ "percent-encoding",
  "png",
  "poem",
  "poem-openapi",
@@ -10755,6 +10755,7 @@ dependencies = [
  "warpgate-db-migrations",
  "warpgate-gitops",
  "warpgate-ldap",
+ "warpgate-resources",
  "warpgate-secrets-vault",
  "warpgate-sso",
  "warpgate-tls",
@@ -10812,6 +10813,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "tempfile",
  "time",
  "tokio",
  "tracing",
@@ -10859,13 +10861,13 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "sha2 0.11.1",
- "strum",
  "tempfile",
  "thiserror 2.0.21",
  "uuid",
  "walkdir",
  "warpgate-common",
  "warpgate-db-entities",
+ "warpgate-resources",
 ]
 
 [[package]]
@@ -11138,6 +11140,18 @@ dependencies = [
  "warpgate-desktop-auth",
  "warpgate-desktop-ui",
  "warpgate-tls",
+]
+
+[[package]]
+name = "warpgate-resources"
+version = "0.31.0-beta.1"
+dependencies = [
+ "schemars 1.2.3",
+ "serde",
+ "serde_json",
+ "uuid",
+ "warpgate-common",
+ "warpgate-db-entities",
 ]
 
 [[package]]
