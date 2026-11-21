@@ -74,8 +74,10 @@ fn request_authorization_as_forwarded_identity_headers(
         X_WARPGATE_CLUSTER_IDENTITY.clone(),
         user.user_id().to_string(),
     )];
-    if matches!(auth, RequestAuthorization::UserToken { .. }) {
-        headers.push((X_WARPGATE_CLUSTER_IDENTITY_TOKEN.clone(), "1".into()));
+    if let RequestAuthorization::UserToken { admin_api, .. } = auth {
+        // "1" carries the admin switch; the peer treats any other value as off
+        let value = if *admin_api { "1" } else { "user" };
+        headers.push((X_WARPGATE_CLUSTER_IDENTITY_TOKEN.clone(), value.into()));
     }
     headers
 }
@@ -380,6 +382,7 @@ mod tests {
         let token = RequestAuthorization::UserToken {
             user_id: UserId(Uuid::nil()),
             username: "alice".into(),
+            admin_api: true,
         };
         assert_eq!(
             names(token),
@@ -388,6 +391,19 @@ mod tests {
                 X_WARPGATE_CLUSTER_IDENTITY_TOKEN.clone()
             ]
         );
+
+        let marker = |admin_api| {
+            headers(&RequestAuthorization::UserToken {
+                user_id: UserId(Uuid::nil()),
+                username: "alice".into(),
+                admin_api,
+            })
+            .into_iter()
+            .find(|(name, _)| *name == X_WARPGATE_CLUSTER_IDENTITY_TOKEN)
+            .map(|(_, value)| value)
+        };
+        assert_eq!(marker(true).as_deref(), Some("1"));
+        assert_eq!(marker(false).as_deref(), Some("user"));
 
         assert!(names(RequestAuthorization::AdminToken).is_empty());
     }

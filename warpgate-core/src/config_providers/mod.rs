@@ -109,6 +109,8 @@ pub trait ConfigProvider {
 pub struct ValidatedApiToken {
     pub id: Uuid,
     pub user: User,
+    /// Whether this token may use the user's admin permissions.
+    pub admin_api: bool,
 }
 
 /// Proof that a user authenticated for a given protocol, and so may be handed to

@@ -25,6 +25,13 @@ enum GetApiTokensResponse {
 struct NewApiToken {
     label: String,
     expiry: OffsetDateTime,
+    /// Allow admin operations with this token
+    #[oai(default = "admin_api_default")]
+    admin_api: bool,
+}
+
+const fn admin_api_default() -> bool {
+    true
 }
 
 #[derive(Object)]
@@ -33,6 +40,7 @@ struct ExistingApiToken {
     label: String,
     created: OffsetDateTime,
     expiry: OffsetDateTime,
+    admin_api: bool,
 }
 
 impl From<ApiToken::Model> for ExistingApiToken {
@@ -42,6 +50,7 @@ impl From<ApiToken::Model> for ExistingApiToken {
             label: token.label,
             created: token.created,
             expiry: token.expiry,
+            admin_api: token.admin_api,
         }
     }
 }
@@ -120,6 +129,7 @@ impl Api {
             expiry: Set(body.expiry),
             label: Set(body.label.clone()),
             secret_hash: Set(hash_secret(secret.expose_secret())),
+            admin_api: Set(body.admin_api),
         }
         .insert(db)
         .await

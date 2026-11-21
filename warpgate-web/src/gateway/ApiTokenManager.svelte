@@ -1,6 +1,7 @@
 <script lang="ts">
     import { faKey } from '@fortawesome/free-solid-svg-icons'
     import { Alert, Badge, Button } from '@sveltestrap/sveltestrap'
+    import { hasAdminAccess } from 'admin/lib/store'
     import CopyableTextArea from 'common/CopyableTextArea.svelte'
     import { parseHumantimeDuration } from 'common/duration'
     import EmptyState from 'common/EmptyState.svelte'
@@ -38,11 +39,15 @@
         lastCreatedSecret = undefined
     }
 
-    async function createToken(label: string, expiry: Date) {
+    async function createToken(
+        label: string,
+        expiry: Date,
+        adminApi?: boolean,
+    ) {
         try {
             error = undefined
             const { secret, token } = await api.createApiToken({
-                newApiToken: { label, expiry },
+                newApiToken: { label, expiry, adminApi },
             })
             lastCreatedSecret = secret
             tokens = [...tokens, token]
@@ -92,6 +97,9 @@
                 <div class="list-group-item d-flex align-items-center pr-0">
                     <Fa fw icon={faKey} />
                     <span class="label ms-3">{token.label}</span>
+                    {#if $hasAdminAccess && token.adminApi}
+                        <Badge color="secondary" class="ms-2">Admin</Badge>
+                    {/if}
                     {#if token.expiry.getTime() < now}
                         <Badge color="danger" class="ms-2">Expired</Badge>
                     {:else}

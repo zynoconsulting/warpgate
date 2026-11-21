@@ -47,6 +47,16 @@ pub async fn admin_permission_set(
     if matches!(ctx.auth, RequestAuthorization::AdminToken) {
         return Ok(AdminPermissionSet::all());
     }
+    // A user token only carries the owner's admin permissions if it was created with them.
+    if matches!(
+        ctx.auth,
+        RequestAuthorization::UserToken {
+            admin_api: false,
+            ..
+        }
+    ) {
+        return Ok(AdminPermissionSet::none());
+    }
     let Some(full) = ctx.auth.as_full_user() else {
         return Ok(AdminPermissionSet::none());
     };

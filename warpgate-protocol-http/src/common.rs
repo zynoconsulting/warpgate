@@ -28,7 +28,7 @@ use warpgate_common_http::{
     X_WARPGATE_CLUSTER_IDENTITY, X_WARPGATE_CLUSTER_IDENTITY_TOKEN, X_WARPGATE_TOKEN,
     is_cluster_peer_request,
 };
-use warpgate_core::{ConfigProvider, vet_credential_bearer};
+use warpgate_core::{ConfigProvider, ValidatedApiToken, vet_credential_bearer};
 use warpgate_db_entities::User;
 use warpgate_sso::WarpgateIdToken;
 
@@ -479,13 +479,12 @@ async fn cluster_request_authorization(
         .await
         .map_err(poem::error::InternalServerError)?
         .map(|user| {
-            if req
-                .headers()
-                .contains_key(&X_WARPGATE_CLUSTER_IDENTITY_TOKEN)
-            {
+            if let Some(marker) = req.headers().get(&X_WARPGATE_CLUSTER_IDENTITY_TOKEN) {
                 RequestAuthorization::UserToken {
                     user_id: user.id,
                     username: user.username,
+                    // Fail closed: only an explicit "1" grants the admin switch
+                    admin_api: marker.as_bytes() == b"1",
                 }
             } else {
                 RequestAuthorization::Session(SessionAuthorization::User {
@@ -503,7 +502,7 @@ async fn user_for_api_token(
     req: &Request,
     ctx: &UnauthenticatedRequestContext,
     token: &str,
-) -> Result<Option<warpgate_common::User>, WarpgateError> {
+) -> Result<Option<ValidatedApiToken>, WarpgateError> {
     let services = ctx.services();
     let remote_ip = get_client_ip_addr(req, services).await;
 
@@ -523,13 +522,12 @@ async fn user_for_api_token(
     let Some(token) = services.config_provider.validate_api_token(token).await? else {
         return Ok(None);
     };
-    let user = token.user;
 
-    if !vet_credential_bearer(&services.login_protection, &user, remote_ip).await? {
+    if !vet_credential_bearer(&services.login_protection, &token.user, remote_ip).await? {
         return Ok(None);
     }
 
-    Ok(Some(user))
+    Ok(Some(token))
 }
 
 pub async fn inject_request_authorization<E: Endpoint + 'static>(
@@ -613,7 +611,10 @@ pub async fn inject_request_authorization<E: Endpoint + 'static>(
             })
         {
             Some(RequestAuthorization::AdminToken)
-        } else if let Some(user) = user_for_api_token(&req, &ctx, token_from_header).await? {
+        } else if let Some(ValidatedApiToken {
+            user, admin_api, ..
+        }) = user_for_api_token(&req, &ctx, token_from_header).await?
+        {
             let endpoint = format!("{} {}", req.method(), req.uri().path());
             let allowed = ctx
                 .services()
@@ -639,6 +640,7 @@ pub async fn inject_request_authorization<E: Endpoint + 'static>(
             Some(RequestAuthorization::UserToken {
                 user_id: user.id,
                 username: user.username,
+                admin_api,
             })
         } else {
             None

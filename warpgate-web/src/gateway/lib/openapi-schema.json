@@ -1909,7 +1909,8 @@
           "id",
           "label",
           "created",
-          "expiry"
+          "expiry",
+          "admin_api"
         ],
         "properties": {
           "id": {
@@ -1926,6 +1927,9 @@
           "expiry": {
             "type": "string",
             "format": "date-time"
+          },
+          "admin_api": {
+            "type": "boolean"
           }
         }
       },
@@ -2341,6 +2345,11 @@
           "expiry": {
             "type": "string",
             "format": "date-time"
+          },
+          "admin_api": {
+            "type": "boolean",
+            "description": "Allow admin operations with this token",
+            "default": true
           }
         }
       },

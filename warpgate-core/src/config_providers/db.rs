@@ -1029,6 +1029,7 @@ impl ConfigProvider for DatabaseConfigProvider {
         Ok(Some(ValidatedApiToken {
             id: api_token.id,
             user: user.try_into()?,
+            admin_api: api_token.admin_api,
         }))
     }
 }

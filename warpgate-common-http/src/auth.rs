@@ -104,6 +104,8 @@ pub enum RequestAuthorization {
     UserToken {
         user_id: UserId,
         username: String,
+        /// Whether the token may use the user's admin permissions
+        admin_api: bool,
     },
     AdminToken,
     /// Auth between cluster peers
@@ -274,12 +276,12 @@ impl RequestAuthorization {
     pub fn as_full_user(&self) -> Option<FullUserAuthorization> {
         match self {
             Self::Session(SessionAuthorization::User { user_id, username })
-            | Self::UserToken { user_id, username } => {
-                Some(FullUserAuthorization(AuthStateUserInfo {
-                    id: *user_id,
-                    username: username.clone(),
-                }))
-            }
+            | Self::UserToken {
+                user_id, username, ..
+            } => Some(FullUserAuthorization(AuthStateUserInfo {
+                id: *user_id,
+                username: username.clone(),
+            })),
             Self::Session(SessionAuthorization::Ticket { .. })
             | Self::AdminToken
             | Self::ClusterPeer => None,
@@ -350,6 +352,7 @@ mod tests {
         RequestAuthorization::UserToken {
             user_id: UserId(Uuid::nil()),
             username: "alice".into(),
+            admin_api: true,
         }
     }
 

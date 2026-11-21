@@ -9,14 +9,14 @@
         ModalFooter,
         ModalHeader,
     } from '@sveltestrap/sveltestrap'
-
+    import { hasAdminAccess } from 'admin/lib/store'
     import { formatDurationAsHumantime } from 'common/duration'
     import { toLocalISO } from 'common/helpers'
     import { serverInfo } from 'gateway/lib/store'
 
     interface Props {
         isOpen: boolean
-        create: (label: string, expiry: Date) => void
+        create: (label: string, expiry: Date, adminApi?: boolean) => void
         initialLabel?: string
         initialExpiryMs?: number
     }
@@ -61,9 +61,10 @@
     )
     let field: HTMLInputElement | undefined = $state()
     let validated = $state(false)
+    let adminApi = $state(true)
 
     function _save() {
-        create(label, new Date(expiry))
+        create(label, new Date(expiry), $hasAdminAccess ? adminApi : undefined)
         _cancel()
     }
 
@@ -100,6 +101,16 @@
                     </small>
                 {/if}
             </FormGroup>
+
+            {#if $hasAdminAccess}
+                <FormGroup check class="mt-3">
+                    <Input
+                        type="checkbox"
+                        label="Allow admin operations with this token"
+                        bind:checked={adminApi}
+                    />
+                </FormGroup>
+            {/if}
         </ModalBody>
         <ModalFooter>
             <Button
